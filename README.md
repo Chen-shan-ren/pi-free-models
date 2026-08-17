@@ -1,126 +1,330 @@
-# pi-free-models — 免费优先的 OpenRouter 模型扩展（pi）
+<div align="center">
 
-一个扩展，两个功能，共享同一份模型数据：
+# pi-free-models
 
-1. **Provider 注册**：`/model` 选择器中 openrouter 提供商**只显示免费模型**（不再有几百个付费模型干扰选择）
-2. **视觉模型池**：纯文本模型也能"看"图片——上传图片时自动交给视觉池中优先级最高的多模态模型识别
+**免费优先的 OpenRouter 模型扩展（pi）** — 一个扩展，两个功能，共享一份模型数据
 
-> 本项目由原 `openrouter-free`（免费 provider）与 `vision-pool`（视觉池）合并而来，
-> 两者共享一次网络拉取，启动更快、维护更简单。
+`/model` 只显示免费模型 · 纯文本模型也能自动"看"图片
 
-## ✨ 功能
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![pi extension](https://img.shields.io/badge/pi-extension-4B32C3)](https://github.com/earendil-works/pi)
 
-### 免费 Provider（/model 只显示免费模型）
+</div>
 
-- 启动时从 OpenRouter 拉取模型目录，把 openrouter provider 替换为**仅免费模型**（定价 0/0）
-- 免费列表变化频繁（每周甚至更勤），缓存 6 小时后自动重新拉取；拉取失败自动回退缓存
-- `models.json` 中自定义的 openrouter 模型按 id 合并保留
-- `/openrouter-free` 手动刷新，`/openrouter-free list` 查看列表
+---
 
-### 视觉模型池（文本模型自动看图）
+## 📖 简介
+
+`pi-free-models` 为 [pi](https://github.com/earendil-works/pi)（AI 编程助手）提供两大能力，且共享同一份 OpenRouter 模型数据（整个扩展启动只拉取**一次**网络）：
+
+1. **免费 Provider 注册**：`/model` 选择器中 openrouter 提供商**只显示免费模型**——不再被几百个付费模型淹没
+2. **视觉模型池**：纯文本模型也能"看"图片——上传图片时自动交给视觉池中优先级最高的多模态模型识别，识别结果以文字注入对话
+
+> 本项目由原 `openrouter-free`（免费 provider）与 `vision-pool`（视觉池）合并而来。
+> 合并后共享数据层、缓存与刷新机制，启动更快、维护更简单。
+
+---
+
+## ✨ 功能一览
+
+| 功能 | 说明 |
+|------|------|
+| 🆓 **免费 Provider** | openrouter 提供商只保留免费模型（定价 0/0），`/model` 干净清爽 |
+| 🔄 **自动刷新** | 免费列表变化频繁（每周甚至更勤），缓存 6h 自动重拉；失败自动回退缓存 |
+| 📷 **自动看图** | 文本模型收到图片时，自动调用视觉池最高优先级的多模态模型描述 |
+| 🎯 **优先级管理** | 免费优先、性能其次；手动优先级刷新后保留 |
+| 🤖 **AI 自动发现** | 读取你配置的模型服务商，用你的模型分析多模态模型并实测验证后入池 |
+| 🛡️ **容错设计** | 下架感知、失败自动刷新重试、网络失败回退缓存 |
+| 🔇 **静默运行** | 不污染 TUI 终端（console 日志全部静默） |
+| 🪶 **零依赖** | 纯 TypeScript，无 npm 包 |
+
+---
+
+## 🚀 快速开始
+
+### 1. 安装
+
+```bash
+# 把整个 pi-free-models 目录复制到 pi 的全局扩展目录
+cp -r pi-free-models ~/.pi/agent/extensions/
+
+# 重启 pi（目录结构扩展必须重启才能识别）
+```
+
+### 2. 配置 API key
+
+```bash
+# OpenRouter（视觉池调用的必需项；拉取模型列表本身不需要 key）
+setx OPENROUTER_API_KEY "sk-or-..."
+```
+
+也可以 `pi` 内执行 `/login openrouter`（凭据存入 `auth.json`，二选一）。
+
+### 3. 验证
 
 ```
-用户上传图片 ──► input 事件拦截
+/mm-status       # 查看视觉池状态、当前模型、API key
+/model           # openrouter 提供商应该只剩免费模型
+/mm-pool free    # 查看视觉池中的免费多模态模型
+```
+
+---
+
+## 📖 功能详解
+
+### 1️⃣ 免费 Provider（/model 只显示免费模型）
+
+```
+pi 启动 ──► 拉取 OpenRouter 全量目录（或读 6h 内缓存）
+              │
+              ├─ 成功 → 注册 openrouter provider = 仅免费模型（20 个左右）
+              └─ 失败 → 回退文件缓存；再失败 → 保留 pi 内置目录
+```
+
+- 免费判定：OpenRouter 对 prompt/completion 均定价 `0`
+- `models.json` 中自定义的 openrouter 模型按 id 合并保留（你手动 pin 的模型不会被删掉）
+- 免费模型通常每周变化，缓存 6 小时后自动重拉
+- 命令：`/openrouter-free`（强制刷新）、`/openrouter-free list`（交互查看列表）
+
+### 2️⃣ 视觉模型池（文本模型自动看图）
+
+```
+用户上传图片 ──► input 事件拦截（消息进入 LLM 之前）
                    │
-                   ├─ 当前模型支持图片？──是──► 原样透传
+                   ├─ 当前模型支持图片？──是──► 原样透传（多模态模型直接看）
                    │
-                   └─ 否（文本模型）──► 调用视觉池中优先级最高的多模态模型
-                                        （OpenRouter API，自动复用已配置的 key）
+                   └─ 否（文本模型）──► 按优先级调用视觉池模型：
+                                         ① OpenRouter 免费多模态（REST）
+                                         ② pi 注册表多模态（走 pi 调用层，鉴权零配置）
+                                         ③ AI 自动发现的多模态（走服务商端点）
                                         │
                                         ▼
                         识别文字替换原图，文本模型正常处理
 ```
 
-- 池 = OpenRouter **免费多模态模型**（免费优先）+ 你在 pi 中配置的多模态模型（如 `xiaomi-clean/mimo-v2.5`，走 pi 自身调用层，鉴权零配置）
-- 混合刷新策略：懒刷新 TTL + 启动后台刷新 + 手动刷新 + **全部失败自动强制刷新重试**（应对免费模型不定期下架）
-- 下架模型标记保留不删除，恢复上架自动解除；手动优先级刷新后保留
-- LLM 可调工具：`describe_image`、`mm_pool_info`
+**池的三个来源：**
 
-## 📦 安装
+| 来源 | 说明 | 默认优先级 |
+|------|------|-----------|
+| OpenRouter 免费多模态 | 免费优先，同档按上下文长度（性能代理）降序 | 1..N |
+| 注册表模型（`includeRegistryModels`） | pi 中已配置鉴权的多模态模型（如 `xiaomi-clean/mimo-v2.5`），走 pi 自身调用层 | 100+ |
+| AI 自动发现（`autoDiscover`） | 读取你的服务商，LLM 分析 + 实测验证后加入 | 免费层末尾 / 1000+ |
 
-```bash
-# 1. 把整个 pi-free-models 目录复制到 pi 的全局扩展目录
-cp -r pi-free-models ~/.pi/agent/extensions/
+**刷新策略（混合式）**：
 
-# 2. 重启 pi（或 /reload）
-```
-
-依赖：OpenRouter API key（`/login openrouter` 或环境变量 `OPENROUTER_API_KEY`）。拉取模型列表本身是公开接口，不需要 key。
-
-## 🖱️ 命令
-
-| 命令 | 说明 |
+| 策略 | 说明 |
 |------|------|
-| `/openrouter-free [list]` | 刷新免费模型并重新注册 provider / 查看列表 |
-| `/mm-pool [free\|paid\|all\|offline]` | 查看视觉池（按优先级排序） |
-| `/mm-refresh` | 强制刷新视觉池 |
-| `/mm-priority [数字] [关键字]` | 设置模型优先级（数字越小越优先） |
-| `/mm-status` | 当前模型、视觉池、API key 状态 |
-| `/mm-config` | 查看视觉池配置 |
+| 懒刷新 + TTL | 池过期（默认 24h）后，第一次需要视觉能力时先刷新再用 |
+| 启动后台刷新 | 启动时若池过期，后台异步刷新（不阻塞启动、离线可用旧池） |
+| 手动刷新 | `/mm-refresh` 随时强制 |
+| 失败触发 | 池中所有候选都失败（典型：免费模型被下架）时自动强制刷新一次并重试 |
 
-示例：
+**优先级规则**：
 
-```
-/mm-priority 1 xiaomi-clean/mimo-v2.5   # 把自定义模型调到最高优先级
-/mm-priority 3 gemini                   # 按关键字设置
-/mm-pool free                           # 只看免费模型
-/mm-discover                            # AI 自动发现（需先开启 autoDiscover）
-```
+- 数字越小越优先（1 = 最高）
+- 默认：免费模型排 1..N（按上下文长度降序），付费/自定义排 100+，AI 发现排其后
+- 手动设置过的优先级（`/mm-priority`）在每次刷新时**永久保留**
+- 下架的模型不删除，标记 `⚠下架` 并跳过调用；恢复上架后自动解除标记
+
+---
 
 ## 🤖 AI 自动发现（autoDiscover）
 
-默认关闭。开启后，视觉池会读取你 `models.json` 中配置的模型服务商（有 baseUrl + API key 的），
-逐个调用它们的 `/models` 接口，用你的模型（`discoverModel` 指定或当前激活模型）分析出多模态模型，
-然后**带图片实测验证**（过滤掉图像生成/编辑等假多模态），通过后才加入池。
+> 适配冷门模型服务商的正解：不为每家写适配器，让 LLM 自适应。
 
-```json
-{ "config": { "autoDiscover": true } }
+默认**关闭**。开启后：
+
+```
+读取 models.json 中的服务商（有 baseUrl + API key）
+      ↓ 逐个调 /models 接口
+服务商返回的模型列表
+      ↓ LLM（你的模型）分析：多模态识别 + 参数估计 + 免费判定
+候选多模态模型
+      ↓ 🔍 带图片实测验证（1x1 PNG 最小请求，max_tokens=1）
+      ✅ 200 → 加入池（discovered 来源）
+      ❌ 4xx → 剔除（图像生成/编辑等假多模态、或模型不可用）
 ```
 
-- 首次运行自动做一次全量发现；之后 `/mm-refresh` 时增量发现新模型
-- 也可手动 `/mm-discover`（增量）或 `/mm-discover full`（全量）
-- 生成的模型走服务商自己的 OpenAI 兼容端点调用（`discovered` 来源）
-- 注意：分析会消耗你的模型少量 token（每次发现 1 次调用 + 每模型 1 次验证）
+**开启方式**（编辑 `~/.pi/agent/vision-pool.json` 的 `config`）：
 
-## 🎯 特点
+```json
+{
+  "config": {
+    "autoDiscover": true,
+    "discoverModel": "modelscope/deepseek-ai/DeepSeek-V4-Flash-0731"
+  }
+}
+```
 
-- **一次拉取，两个功能**：共享数据层（内存 + 文件缓存 + 防并发），整个扩展启动只拉取一次网络
-- **免费优先**：/model 干净清爽；视觉池默认只保留免费多模态模型（`includePaid` 可放开）
-- **全自动看图**：消息进入 LLM 之前拦截，文本模型 + 图片时自动走视觉池
-- **容错**：网络失败回退缓存；免费模型下架自动感知；全部失败自动刷新重试
-- **静默运行**：不在终端输出任何日志（TUI 下 console 输出会污染屏幕）
-- **零依赖**：纯 TypeScript，无 npm 包
+- `discoverModel`：用于分析的模型（`provider/model`），空则用当前激活模型；推荐免费模型
+- 首次运行自动做一次**全量发现**；之后 `/mm-refresh` 时**增量发现**新模型
+- 手动触发：`/mm-discover`（增量）/ `/mm-discover full`（全量）
+- 发现的模型在 `/mm-pool` 中标记为 `发现`，走服务商自己的 OpenAI 兼容端点调用
 
-## ⚙️ 配置
+**成本**：每次发现 = 1 次 LLM 分析调用（几百 token）+ 每模型 1 次验证调用（1 token 级）——免费额度完全扛得住。
 
-视觉池配置 `~/.pi/agent/vision-pool.json`（`config` 字段，改后 `/reload` 生效）：
+**防幻觉设计**：
+
+| 风险 | 对策 |
+|------|------|
+| LLM 编造模型 id | 输出 id 必须与列表完全一致，否则丢弃 |
+| 编造上下文/参数 | 带图片实测验证，实际请求会暴露真实限制 |
+| 误判"免费" | `discoverFreeOnly` 默认 false（免费标记只影响排序，不阻断收录） |
+| 假多模态（图像生成模型） | 验证请求**带图片**——生成模型不接受 image_url 输入，被 4xx 剔除 |
+
+---
+
+## 🛠️ 命令参考
+
+| 命令 | 说明 |
+|------|------|
+| `/openrouter-free [list]` | 强制刷新免费模型并重新注册 provider / 交互查看列表 |
+| `/mm-pool [free\|paid\|all\|offline]` | 查看视觉池（按优先级排序，TUI 下打开编辑器展示完整列表） |
+| `/mm-refresh` | 强制刷新视觉池（免费模型不定期上架/下架） |
+| `/mm-priority [数字] [关键字]` | 设置模型优先级（无参数时交互选择） |
+| `/mm-discover [full]` | AI 自动发现（增量 / 全量） |
+| `/mm-status` | 当前模型、视觉池、API key、自动发现状态 |
+| `/mm-config` | 查看视觉池配置 |
+
+**LLM 可调用工具**：
+
+| 工具 | 说明 |
+|------|------|
+| `describe_image` | 显式描述图片（本地路径 / data URL / 裸 base64） |
+| `mm_pool_info` | 查询视觉池信息（数量、优先级、免费/付费等） |
+
+---
+
+## ⚙️ 配置参考
+
+配置文件：`~/.pi/agent/vision-pool.json`（`config` 字段，修改后 `/reload` 生效）
 
 | 配置项 | 默认 | 说明 |
 |--------|------|------|
-| `ttlHours` | 24 | 池过期时间（小时） |
-| `refreshOnStartup` | true | 启动时后台异步刷新 |
-| `refreshOnAllFailed` | true | 全部候选失败时强制刷新重试 |
-| `freeFirst` | true | 免费模型默认排前面 |
-| `includePaid` | false | 池中是否包含付费模型 |
-| `includeRegistryModels` | true | 自动纳入 pi 中已配置鉴权的多模态模型 |
-| `maxModels` | 200 | 池容量上限 |
-| `describeMaxTokens` | 2048 | 识别输出最大 token |
-| `forceDescribe` | false | 即使当前模型支持图片也强制走视觉池 |
-| `autoDiscover` | false | **AI 自动发现**：读取用户 models.json 配置的服务商，调其 /models 接口，用你的模型分析多模态模型并带图片实测验证后加入池（首次运行全量，之后刷新时增量） |
-| `discoverModel` | 空 | 用于分析的模型（`provider/model`，空=用当前激活模型） |
-| `discoverFreeOnly` | false | 严格模式：只收录 LLM 判定为免费的新模型（LLM 判断不可靠，默认收全部，免费标记只影响优先级） |
+| `ttlHours` | `24` | 池过期时间（小时） |
+| `refreshOnStartup` | `true` | 启动时后台异步刷新 |
+| `refreshOnAllFailed` | `true` | 全部候选失败时强制刷新重试 |
+| `freeFirst` | `true` | 免费模型默认排前面 |
+| `includePaid` | `false` | 池中是否包含付费模型 |
+| `includeRegistryModels` | `true` | 自动纳入 pi 中已配置鉴权的多模态模型 |
+| `maxModels` | `200` | 池容量上限 |
+| `describeMaxTokens` | `2048` | 识别输出最大 token |
+| `forceDescribe` | `false` | 即使当前模型支持图片也强制走视觉池 |
+| `autoDiscover` | `false` | AI 自动发现开关 |
+| `discoverModel` | `""` | 用于分析的模型（`provider/model`，空=当前激活模型） |
+| `discoverFreeOnly` | `false` | 严格模式：只收录 LLM 判定为免费的模型 |
 | `openrouterBaseUrl` | `https://openrouter.ai/api/v1` | OpenRouter API 地址 |
-| `describePrompt` | （中文描述提示词） | 发给视觉模型的识别提示词 |
+| `describePrompt` | （中文提示词） | 发给视觉模型的识别提示词 |
+
+完整示例：
+
+```json
+{
+  "updatedAt": 1787000000000,
+  "config": {
+    "ttlHours": 24,
+    "refreshOnStartup": true,
+    "refreshOnAllFailed": true,
+    "freeFirst": true,
+    "includePaid": false,
+    "includeRegistryModels": true,
+    "maxModels": 200,
+    "describeMaxTokens": 2048,
+    "forceDescribe": false,
+    "autoDiscover": false,
+    "discoverModel": "",
+    "discoverFreeOnly": false,
+    "openrouterBaseUrl": "https://openrouter.ai/api/v1"
+  },
+  "models": []
+}
+```
+
+---
+
+## ❓ 常见问题（FAQ）
+
+**Q：为什么 `/model` 里看不到某些 provider？**
+pi 的规则：**没有配置鉴权的 provider 不显示**。检查对应环境变量/`/login` 是否已配置，然后重启 pi。
+
+**Q：`/mm-pool` 里出现 `⚠下架` 是什么？**
+该模型已从 OpenRouter 下架（免费模型上架/下架很频繁）。扩展保留它并跳过调用，恢复上架后自动解除标记。
+
+**Q：为什么识别图片时偶尔会失败/变慢？**
+视觉池按优先级逐个尝试，免费模型可能限流（429）或临时不可用，会**自动回退到下一个模型**；全部失败会触发强制刷新重试。
+
+**Q：`discovered` 来源的模型是什么？**
+AI 自动发现（`autoDiscover`）从你的模型服务商（如魔搭）发现的、经带图片实测验证的多模态模型。走服务商自己的端点调用。
+
+**Q：为什么 AI 发现出的模型上下文是 131072？**
+LLM 对未公布上下文的模型填保守估计值（131072）。如果你知道真实值，用 `/mm-priority` 无法修改上下文——需要手动编辑 `vision-pool.json` 中该条目的 `contextLength`。
+
+**Q：`includePaid: true` 后付费模型还是排最后吗？**
+是的。免费模型（`freeFirst`）永远排前面，付费模型排 10000+；手动设置过优先级的除外。
+
+**Q：拉取模型列表需要 key 吗？**
+不需要。OpenRouter `/models` 是公开接口；但**调用模型描述图片**需要 `OPENROUTER_API_KEY`（或 `/login openrouter`）。
+
+---
 
 ## 🗂️ 项目结构
 
 ```
-pi-free-models/          # 复制整个目录到 ~/.pi/agent/extensions/
-├── index.ts             # 入口（协调两个模块）
-├── or-free.ts           # 共享数据层 + 免费 provider 注册
-└── vision-pool.ts       # 视觉模型池
+pi-free-models/              # 复制整个目录到 ~/.pi/agent/extensions/
+├── index.ts                 # 入口（协调三个模块）
+├── or-free.ts               # 共享数据层（拉取/缓存/防并发）+ 免费 provider 注册
+├── vision-pool.ts           # 视觉模型池（自动看图 + AI 自动发现）
+└── filter-providers.ts      # 内置 provider 模型筛选（nvidia/cloudflare/zai 只留旗舰）
 ```
+
+---
+
+## 📝 更新日志
+
+| 版本 | 内容 |
+|------|------|
+| 2026-08 | 合并 openrouter-free + vision-pool 为 pi-free-models（共享数据层，一次拉取） |
+| 2026-08 | 新增内置 provider 筛选（nvidia / cloudflare-workers-ai / zai 只保留旗舰模型） |
+| 2026-08 | 新增 AI 自动发现（autoDiscover：服务商 /models + LLM 分析 + 带图片实测验证） |
+
+---
+
+## 🤝 贡献
+
+欢迎提交 Issue 和 PR：
+
+- 新平台适配建议（AI 自动发现让大多数平台无需硬编码适配）
+- 视觉池新特性
+- 文档改进
+
+开发时用 `CHAT_MARKS_DEBUG=1` 环境变量可临时打开日志（对应 chat-marks 项目）。
+
+---
 
 ## 📄 License
 
-MIT
+本项目采用 **MIT License**，全文本见 [LICENSE](LICENSE)。
+
+```
+MIT License
+
+Copyright (c) 2026 Chen-shan-ren
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
