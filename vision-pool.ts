@@ -336,10 +336,8 @@ async function doRefresh(force: boolean, ctx: ExtensionContext): Promise<PoolSta
   const { pool, added, removed, restored } = buildPool(current, raw, current.config);
   const merged = await mergeRegistryIntoPool(pool, ctx);
   await savePool(merged.pool);
-  console.log(
-    `[vision-pool] refreshed: ${merged.pool.models.filter((m) => !m.offline).length} online multimodal models` +
-      ` (added ${added.length}, removed ${removed.length}, restored ${restored.length})`,
-  );
+  // 注意：TUI 模式下 console.log 会直接污染终端屏幕（/resume 重载扩展或后台刷新时
+  // 会再次打印到屏幕上，直到下次重绘才消失），因此这里静默处理。
   return merged.pool;
 }
 
