@@ -1,13 +1,15 @@
 <div align="center">
 
-# pi-free-models
+# pi-wanchuan（万川）
 
-**免费优先的 OpenRouter 模型扩展（pi）** — 一个扩展，两个功能，共享一份模型数据
+**万池归于此 · 百川东到海** — 免费优先的 pi 模型池扩展
 
-`/model` 只显示免费模型 · 纯文本模型也能自动"看"图片
+`/model` 只显示免费模型 · 纯文本模型自动看图 · 图像生成/嵌入/TTS 池
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![pi extension](https://img.shields.io/badge/pi-extension-4B32C3)](https://github.com/earendil-works/pi)
+
+> **slogan：百川东到海** —— 众多模型服务商如百川，汇聚入池体系如归海。
 
 </div>
 
@@ -15,7 +17,7 @@
 
 ## 📖 简介
 
-`pi-free-models` 为 [pi](https://github.com/earendil-works/pi)（AI 编程助手）提供两大能力，且共享同一份 OpenRouter 模型数据（整个扩展启动只拉取**一次**网络）：
+`pi-wanchuan`（万川）为 [pi](https://github.com/earendil-works/pi)（AI 编程助手）提供模型池体系，且共享同一份模型数据（整个扩展启动只拉取**一次**网络）：
 
 1. **免费 Provider 注册**：`/model` 选择器中 openrouter 提供商**只显示免费模型**——不再被几百个付费模型淹没
 2. **视觉模型池**：纯文本模型也能"看"图片——上传图片时自动交给视觉池中优先级最高的多模态模型识别，识别结果以文字注入对话
@@ -45,8 +47,8 @@
 ### 1. 安装
 
 ```bash
-# 把整个 pi-free-models 目录复制到 pi 的全局扩展目录
-cp -r pi-free-models ~/.pi/agent/extensions/
+# 把整个 pi-wanchuan 目录复制到 pi 的全局扩展目录
+cp -r pi-wanchuan ~/.pi/agent/extensions/
 
 # 重启 pi（目录结构扩展必须重启才能识别）
 ```
@@ -270,7 +272,7 @@ LLM 对未公布上下文的模型填保守估计值（131072）。如果你知�
 ## 🗂️ 项目结构
 
 ```
-pi-free-models/              # 复制整个目录到 ~/.pi/agent/extensions/
+pi-wanchuan/              # 复制整个目录到 ~/.pi/agent/extensions/
 ├── index.ts                 # 入口（协调三个模块）
 ├── or-free.ts               # 共享数据层（拉取/缓存/防并发）+ 免费 provider 注册
 ├── vision-pool.ts           # 视觉模型池（自动看图 + AI 自动发现）
@@ -283,7 +285,7 @@ pi-free-models/              # 复制整个目录到 ~/.pi/agent/extensions/
 
 | 版本 | 内容 |
 |------|------|
-| 2026-08 | 合并 openrouter-free + vision-pool 为 pi-free-models（共享数据层，一次拉取） |
+| 2026-08 | 合并 openrouter-free + vision-pool 为 pi-wanchuan（共享数据层，一次拉取） |
 | 2026-08 | 新增内置 provider 筛选（nvidia / cloudflare-workers-ai / zai 只保留旗舰模型） |
 | 2026-08 | 新增 AI 自动发现（autoDiscover：服务商 /models + LLM 分析 + 带图片实测验证） |
 

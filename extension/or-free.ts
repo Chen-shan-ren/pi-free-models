@@ -1,5 +1,5 @@
 /**
- * or-free.ts — OpenRouter 免费模型数据层 + provider 注册（pi-free-models 扩展模块）
+ * or-free.ts — OpenRouter 免费模型数据层 + provider 注册（pi-wanchuan 扩展模块）
  *
  * 职责：
  * 1. 数据层：拉取 OpenRouter 全量模型列表并缓存（内存 + 文件），供本扩展的
