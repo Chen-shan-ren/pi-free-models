@@ -89,8 +89,11 @@ interface PoolModel {
   priority: number; // 1 = 最高
   userSet?: boolean; // 优先级是否由用户手动设置（刷新时保留）
   offline?: boolean; // 已从 OpenRouter 下架
-  source?: "openrouter" | "registry"; // 来源：OpenRouter 池 / pi 注册表（自定义模型）
-  provider?: string; // registry 条目的 provider id（如 xiaomi-clean）
+  source?: "openrouter" | "registry" | "discovered"; // 来源：OpenRouter / 注册表 / AI 自动发现
+  provider?: string; // registry/discovered 条目的 provider id（如 xiaomi-clean）
+  baseUrl?: string; // discovered：服务商 baseUrl
+  apiKeyRef?: string; // discovered：服务商 apiKey 的环境变量引用（如 $MODELSCOPE_API_TOKEN）
+  reasoning?: boolean; // discovered：LLM 判定的推理能力
   pricing?: { prompt?: string; completion?: string };
 }
 
@@ -113,6 +116,13 @@ interface PoolConfig {
   forceDescribe: boolean;
   openrouterBaseUrl: string;
   describePrompt: string;
+  /** AI 自动发现（默认关闭）：读取用户配置的服务商并调用其 /models 接口，
+   *  用用户的模型分析出多模态模型并实测验证后加入池 */
+  autoDiscover: boolean;
+  /** 用于分析的模型："provider/model" 或空（空=用当前激活模型） */
+  discoverModel: string;
+  /** 只纳入 LLM 判定为免费的新模型 */
+  discoverFreeOnly: boolean;
 }
 
 interface PoolState {
@@ -140,6 +150,11 @@ const DEFAULT_CONFIG: PoolConfig = {
   describeMaxTokens: 2048,
   forceDescribe: false,
   openrouterBaseUrl: "https://openrouter.ai/api/v1",
+  autoDiscover: false,
+  discoverModel: "",
+  // LLM 对“免费”判断不可靠（服务商不标注），默认收录所有多模态模型，
+  // 免费标记只影响优先级排序；设为 true 可严格只收 LLM 判定为免费的
+  discoverFreeOnly: false,
   describePrompt:
     "你是图片识别代理。请用中文详细描述用户提供的图片内容：包括可见的文字（原样转录）、界面/布局、图表数据、颜色、物体与场景等所有重要细节。若有多张图片，请按图片顺序逐张描述，并分别标注“图片 1”、“图片 2”。只输出描述本身，不要输出任何解释或前言。",
 };
@@ -383,6 +398,8 @@ async function mergeRegistryIntoPool(
   for (const r of sorted) {
     const key = `${r.provider}/${r.id}`;
     const prev = oldByKey.get(key);
+    // 去重：池中已有同 id 的可用来源（discovered）时，不再重复加入 registry 条目
+    if (!prev && pool.models.some((m) => m.id === r.id && !m.offline)) continue;
     if (prev) {
       if (prev.name !== r.name || prev.contextLength !== r.contextLength) changed = true;
       synced.push({ ...prev, name: r.name, contextLength: r.contextLength, offline: false });
@@ -401,6 +418,291 @@ async function mergeRegistryIntoPool(
   }
   const keptOthers = pool.models.filter((m) => m.source !== "registry");
   return { pool: { ...pool, models: sortModels([...keptOthers, ...synced]) }, changed };
+}
+
+// ---------------------------------------------------------------------------
+// AI 自动发现（读取用户服务商 + LLM 分析 + 实测验证）
+// ---------------------------------------------------------------------------
+
+/** 读取环境变量：优先进程环境，回退 Windows 注册表（setx 后未重启也能读到）。 */
+function getEnvValue(name: string): string | undefined {
+  const v = process.env[name];
+  if (v) return v;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { execSync } = require("node:child_process") as typeof import("node:child_process");
+    const out = execSync(`reg query \"HKCU\\\\Environment\" /v ${name}`, {
+      encoding: "utf8",
+      windowsHide: true,
+      timeout: 5000,
+    });
+    const m = out.match(/REG_SZ\s+(\S.*)/);
+    return m ? m[1].trim() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** 解析 apiKey 配置值：支持明文与 $ENV 引用。 */
+function resolveApiKey(apiKeyConfig: unknown): string | undefined {
+  if (typeof apiKeyConfig !== "string" || !apiKeyConfig) return undefined;
+  const m = apiKeyConfig.match(/^\$(.+)$/);
+  return m ? getEnvValue(m[1]) : apiKeyConfig;
+}
+
+/** 用户 models.json 中配置的自定义 provider（有 baseUrl 且能解析出 key 的）。 */
+interface UserProviderInfo {
+  id: string;
+  name: string;
+  baseUrl: string;
+  apiKey: string;
+}
+
+/** 拉取服务商的模型列表（OpenAI 兼容 /models 端点）。失败返回 null。 */
+async function fetchProviderModelList(
+  baseUrl: string,
+  apiKey: string,
+): Promise<{ id: string }[] | null> {
+  try {
+    const res = await fetch(`${baseUrl.replace(/\/$/, "")}/models`, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: AbortSignal.timeout(20_000),
+    });
+    if (!res.ok) return null;
+    const j = (await res.json()) as { data?: { id?: string }[] };
+    const list = Array.isArray(j?.data) ? j.data.filter((m) => typeof m.id === "string") : [];
+    return list.length > 0 ? list : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 从 LLM 输出中提取 JSON 数组（容忍 markdown 代码块/前后文字）。 */
+function extractJsonArray(text: string): unknown[] | null {
+  const trimmed = text.trim();
+  const start = trimmed.indexOf("[");
+  const end = trimmed.lastIndexOf("]");
+  if (start === -1 || end <= start) return null;
+  try {
+    const parsed = JSON.parse(trimmed.slice(start, end + 1));
+    return Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+interface DiscoveredModelInfo {
+  id: string;
+  reasoning: boolean;
+  contextWindow: number;
+  maxTokens: number;
+  free: boolean;
+}
+
+/**
+ * 调用用户的模型分析服务商模型列表，找出多模态模型并生成配置。
+ * 用 ctx.modelRegistry.complete 走 pi 自身调用层（鉴权/协议自动处理）。
+ */
+async function analyzeWithLLM(
+  ctx: ExtensionContext,
+  config: PoolConfig,
+  providerName: string,
+  baseUrl: string,
+  modelIds: string[],
+): Promise<DiscoveredModelInfo[]> {
+  let model = ctx.model;
+  if (config.discoverModel) {
+    const slash = config.discoverModel.indexOf("/");
+    if (slash > 0) {
+      model =
+        ctx.modelRegistry.find(config.discoverModel.slice(0, slash), config.discoverModel.slice(slash + 1)) ??
+        model;
+    }
+  }
+  if (!model) return [];
+
+  const prompt =
+    "你是模型清单分析器。下面是模型服务商\"" +
+    providerName +
+    "\"（" +
+    baseUrl +
+    "）返回的模型列表 JSON：\n" +
+    JSON.stringify(modelIds) +
+    "\n\n请从列表中找出【支持图片输入（多模态）】的模型，输出 JSON 数组，每个元素：" +
+    '{"id":"与列表完全一致的id","reasoning":true/false,"contextWindow":整数,"maxTokens":整数,"free":true/false}\n' +
+    "规则：\n" +
+    "1. 只输出 JSON 数组本身，禁止任何其他文字/解释/markdown 代码块\n" +
+    "2. id 必须与列表中的完全一致，不能编造\n" +
+    "3. contextWindow/maxTokens 不确定时填 131072/16384，不要编造离谱数值\n" +
+    "4. free 仅当你确定该模型在服务商处免费时为 true，否则 false\n" +
+    "5. 判断多模态：id 含 vl/vision/omni/4v/4o 等视觉理解标识，或你确知的视觉理解模型\n" +
+    "6. 排除图像生成/编辑/视频生成类模型（如 id 含 image-edit/generation/video 或已知是生成模型的）——它们不能理解图片\n" +
+    "7. 若没有多模态模型，输出 []";
+
+  try {
+    const message = {
+      role: "user" as const,
+      content: [{ type: "text" as const, text: prompt }],
+      timestamp: Date.now(),
+    };
+    const result = await ctx.modelRegistry.complete(model, { messages: [message] } as never, {
+      maxTokens: 4000,
+      signal: AbortSignal.timeout(120_000),
+    });
+    const text = (result.content ?? [])
+      .filter((c) => c.type === "text")
+      .map((c) => (c as { text: string }).text)
+      .join("\n");
+    const arr = extractJsonArray(text);
+    if (!arr) return [];
+    const known = new Set(modelIds);
+    const out: DiscoveredModelInfo[] = [];
+    for (const item of arr) {
+      if (!item || typeof item !== "object") continue;
+      const o = item as Record<string, unknown>;
+      if (typeof o.id !== "string" || !known.has(o.id)) continue; // 杜绝编造 id
+      out.push({
+        id: o.id,
+        reasoning: o.reasoning === true,
+        contextWindow: typeof o.contextWindow === "number" ? o.contextWindow : 131072,
+        maxTokens: typeof o.maxTokens === "number" ? o.maxTokens : 16384,
+        free: o.free === true,
+      });
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+/** 实测验证：发一个带图片的最小请求（1x1 PNG + max_tokens=1）。
+ *  只有真正支持图片输入（多模态理解）的模型才会返回 200——
+ *  图像生成/编辑模型不接受 image_url 输入，会被 4xx 剔除。 */
+async function verifyDiscovered(
+  baseUrl: string,
+  apiKey: string,
+  modelId: string,
+): Promise<boolean> {
+  try {
+    const res = await fetch(`${baseUrl.replace(/\/$/, "")}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: modelId,
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "hi" },
+              {
+                type: "image_url",
+                image_url: {
+                  url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+                },
+              },
+            ],
+          },
+        ],
+        max_tokens: 1,
+      }),
+      signal: AbortSignal.timeout(30_000),
+    });
+    return res.status === 200;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * AI 自动发现主流程：读用户配置的 provider → 拉 /models → LLM 分析多模态 →
+ * 实测验证 → 合并进池。incremental=true 时只处理池中不存在的模型。
+ */
+async function runDiscovery(ctx: ExtensionContext, incremental: boolean): Promise<number> {
+  const pool = await loadPool();
+  if (!pool.config.autoDiscover) {
+    ctx.ui.notify("AI 自动发现未开启（vision-pool.json 配置 autoDiscover: true 后启用）", "warning");
+    return 0;
+  }
+  // 读取用户配置的 provider（同步读 models.json）
+  let providerDefs: Record<string, { name?: string; baseUrl?: string; apiKey?: string }> = {};
+  try {
+    const { readFileSync } = await import("node:fs");
+    const raw = readFileSync(join(getAgentDir(), "models.json"), "utf8");
+    const cfg = JSON.parse(raw) as { providers?: typeof providerDefs };
+    providerDefs = cfg.providers ?? {};
+  } catch {
+    ctx.ui.notify("读取 models.json 失败，无法自动发现", "warning");
+    return 0;
+  }
+
+  let discovered = 0;
+  for (const [id, def] of Object.entries(providerDefs)) {
+    if (id === "openrouter") continue; // OpenRouter 已有专门逻辑
+    if (!def?.baseUrl) continue;
+    const apiKey = resolveApiKey(def.apiKey);
+    if (!apiKey) continue; // 无 key 无法拉列表
+
+    ctx.ui.notify(`[vision-pool] 正在分析 ${def.name ?? id} 的多模态模型…`, "info");
+    const list = await fetchProviderModelList(def.baseUrl, apiKey);
+    if (!list || list.length === 0) continue;
+    const knownIds = new Set(pool.models.map((m) => m.id));
+    const candidates = incremental
+      ? list.filter((m) => !knownIds.has(m.id)).map((m) => m.id)
+      : list.map((m) => m.id);
+    if (candidates.length === 0) continue;
+
+    const analyzed = await analyzeWithLLM(ctx, pool.config, def.name ?? id, def.baseUrl, candidates);
+    for (const info of analyzed) {
+      if (pool.config.discoverFreeOnly && !info.free) continue; // 严格模式：只收免费的
+      // 实测验证（防 LLM 幻觉：id 错/参数错/实际不可用）
+      const ok = await verifyDiscovered(def.baseUrl, apiKey, info.id);
+      if (!ok) continue;
+      // 去重：池中已有同 id 的可用条目（registry/discovered）则不重复添加
+      const existingAny = pool.models.find((m) => m.id === info.id && !m.offline);
+      if (existingAny) {
+        if (existingAny.source === "discovered") {
+          existingAny.name = existingAny.name || info.id;
+          existingAny.contextLength = info.contextWindow;
+          existingAny.free = info.free;
+          existingAny.reasoning = info.reasoning;
+        }
+        // registry 已有：保留 registry 条目（走 pi 调用层更优），跳过
+        continue;
+      }
+      // 新条目：free → 免费层末尾；非 free → 1000+ 区间
+      const freeMax = Math.max(
+        0,
+        ...pool.models.filter((m) => m.free && m.source !== "discovered").map((m) => m.priority),
+      );
+      const paidMax = Math.max(
+        999,
+        ...pool.models.filter((m) => !m.free).map((m) => m.priority),
+      );
+      pool.models.push({
+        id: info.id,
+        name: info.id,
+        contextLength: info.contextWindow,
+        free: info.free,
+        priority: info.free ? freeMax + 1 : paidMax + 1,
+        source: "discovered",
+        provider: id,
+        baseUrl: def.baseUrl,
+        apiKeyRef: typeof def.apiKey === "string" && def.apiKey.startsWith("$") ? def.apiKey : undefined,
+        reasoning: info.reasoning,
+      });
+      discovered++;
+    }
+  }
+  if (discovered > 0) {
+    await savePool({ ...pool, models: sortModels(pool.models) });
+    ctx.ui.notify(`[vision-pool] AI 自动发现：新增 ${discovered} 个多模态模型`, "info");
+  } else {
+    ctx.ui.notify("[vision-pool] AI 自动发现完成：没有新的多模态模型", "info");
+  }
+  return discovered;
 }
 
 // ---------------------------------------------------------------------------
@@ -502,6 +804,57 @@ async function callRegistryModel(
   return text;
 }
 
+/** 调用 AI 自动发现的模型（用户服务商的 OpenAI 兼容端点，通用 REST）。 */
+async function callDiscoveredModel(
+  entry: PoolModel,
+  images: ImageContentLike[],
+  prompt: string,
+  signal: AbortSignal,
+): Promise<string> {
+  if (!entry.baseUrl) throw new Error("discovered 模型缺少 baseUrl");
+  const apiKeyRef = entry.apiKeyRef ?? "";
+  const apiKey = apiKeyRef.startsWith("$") ? getEnvValue(apiKeyRef.slice(1)) : undefined;
+  if (!apiKey) throw new Error(`无法解析 ${entry.provider} 的 API key（${apiKeyRef}）`);
+  const config = (await loadPool()).config;
+  const content: unknown[] = [{ type: "text", text: prompt }];
+  for (const img of images) {
+    if (!img.data) continue;
+    if (img.data.length > MAX_IMAGE_BYTES * 1.34) throw new Error("图片过大（base64 超过 20MB）");
+    content.push({
+      type: "image_url",
+      image_url: { url: `data:${img.mimeType || "image/png"};base64,${img.data}` },
+    });
+  }
+  const res = await fetch(`${entry.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model: entry.id,
+      messages: [{ role: "user", content }],
+      max_tokens: config.describeMaxTokens,
+    }),
+    signal,
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`HTTP ${res.status} ${body.slice(0, 160)}`);
+  }
+  const payload = (await res.json()) as {
+    choices?: Array<{ message?: { content?: unknown } }>;
+  };
+  const out = payload?.choices?.[0]?.message?.content;
+  if (typeof out === "string") return out;
+  if (Array.isArray(out)) {
+    return out
+      .map((p) => (typeof p?.text === "string" ? p.text : ""))
+      .join("");
+  }
+  throw new Error("模型返回了空响应");
+}
+
 /**
  * 按优先级依次调用池中模型（OpenRouter REST 与注册表模型混排），直到成功。
  * 全部失败时：若配置允许，强制刷新池（处理免费模型被下架的情况）后重试一次。
@@ -531,11 +884,16 @@ async function describeImages(
         const text =
           m.source === "registry"
             ? await callRegistryModel(ctx, m, images, prompt, timeout)
-            : await callOpenRouter(config, apiKey, m.id, images, prompt, timeout);
-        const modelId = m.source === "registry" ? `${m.provider}/${m.id}` : m.id;
+            : m.source === "discovered"
+              ? await callDiscoveredModel(m, images, prompt, timeout)
+              : await callOpenRouter(config, apiKey, m.id, images, prompt, timeout);
+        const modelId =
+          m.source === "registry" || m.source === "discovered" ? `${m.provider}/${m.id}` : m.id;
         return { text, modelId };
       } catch (err) {
-        errors.push(`${m.source === "registry" ? `${m.provider}/${m.id}` : m.id}: ${errMsg(err)}`);
+        errors.push(
+          `${m.source === "registry" || m.source === "discovered" ? `${m.provider}/${m.id}` : m.id}: ${errMsg(err)}`,
+        );
       }
     }
     return undefined;
@@ -647,6 +1005,13 @@ export function initVisionPool(pi: ExtensionAPI) {
   // ---- 启动后台刷新（不阻塞启动） ----
   pi.on("session_start", async (_event, ctx) => {
     const pool = await loadPool();
+    if (pool.config.autoDiscover && ctx.mode === "tui") {
+      // 首次运行：池里还没有 discovered 条目时，做一次全量 AI 自动发现
+      const hasDiscovered = pool.models.some((m) => m.source === "discovered");
+      if (!hasDiscovered) {
+        void runDiscovery(ctx, false).catch(() => {});
+      }
+    }
     if (!pool.config.refreshOnStartup || isFresh(pool)) return;
     refreshPool(false, ctx)
       .then((fresh) => {
@@ -675,6 +1040,7 @@ export function initVisionPool(pi: ExtensionAPI) {
       }
       const online = pool.models.filter((m) => !m.offline);
       const registryCount = online.filter((m) => m.source === "registry").length;
+      const discoveredCount = online.filter((m) => m.source === "discovered").length;
       const list = sortModels(pool.models).filter((m) => {
         if (filter === "free") return !m.offline && m.free;
         if (filter === "paid") return !m.offline && !m.free && m.source !== "registry";
@@ -684,15 +1050,15 @@ export function initVisionPool(pi: ExtensionAPI) {
       });
       const lines = [
         `视觉模型池：在线 ${online.length} 个（免费 ${online.filter((m) => m.free).length}，` +
-          `自定义 ${registryCount}），下架 ${pool.models.length - online.length} 个，` +
+          `自定义 ${registryCount}，发现 ${discoveredCount}），下架 ${pool.models.length - online.length} 个，` +
           `更新于 ${pool.updatedAt ? new Date(pool.updatedAt).toLocaleString() : "从未"}`,
         `设置优先级：/mm-priority [数字] [关键字]（数字越小越优先；默认免费模型在前）`,
         ``,
         ...list.map(
           (m, i) =>
             `${String(i + 1).padStart(3)}. [${String(m.priority).padStart(5)}] ` +
-            `${m.offline ? "⚠下架" : m.source === "registry" ? "自定义" : m.free ? "FREE" : "paid"} ` +
-            `${m.source === "registry" ? `${m.provider}/${m.id}` : m.id}  ` +
+            `${m.offline ? "⚠下架" : m.source === "registry" ? "自定义" : m.source === "discovered" ? "发现" : m.free ? "FREE" : "paid"} ` +
+            `${m.source === "registry" || m.source === "discovered" ? `${m.provider}/${m.id}` : m.id}  ` +
             `ctx=${fmtContext(m.contextLength)}${m.userSet ? "  [自定义优先级]" : ""}`,
         ),
       ];
@@ -728,9 +1094,22 @@ export function initVisionPool(pi: ExtensionAPI) {
             `本次下架 ${delisted.length} 个${restored > 0 ? `，恢复 ${restored} 个` : ""}`,
           "info",
         );
+        // autoDiscover 开启时：刷新后增量发现服务商的新多模态模型
+        if ((await loadPool()).config.autoDiscover) {
+          await runDiscovery(ctx, true);
+        }
       } catch (err) {
         ctx.ui.notify(`刷新失败：${errMsg(err)}`, "error");
       }
+    },
+  });
+
+  // ---- 命令：/mm-discover ----
+  pi.registerCommand("mm-discover", {
+    description: "AI 自动发现：读取用户配置的模型服务商，分析并验证多模态模型后加入池",
+    handler: async (args, ctx) => {
+      const incremental = args.trim() !== "full";
+      await runDiscovery(ctx, incremental);
     },
   });
 
