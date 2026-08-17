@@ -65,10 +65,11 @@
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, getSelectListTheme } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { join, isAbsolute } from "node:path";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { getOpenRouterCatalog, isFreeModel, type RawORModel } from "./or-free.ts";
 
 // ---------------------------------------------------------------------------
 // 类型
@@ -78,14 +79,6 @@ interface ImageContentLike {
   type: "image";
   data: string;
   mimeType: string;
-}
-
-interface RawORModel {
-  id: string;
-  name?: string;
-  context_length?: number;
-  architecture?: { input_modalities?: string[] };
-  pricing?: { prompt?: string; completion?: string };
 }
 
 interface PoolModel {
@@ -133,7 +126,6 @@ interface PoolState {
 // ---------------------------------------------------------------------------
 
 const POOL_FILE = join(getAgentDir(), "vision-pool.json");
-const REFRESH_TIMEOUT_MS = 30_000;
 const DESCRIBE_TIMEOUT_MS = 120_000;
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024; // base64 上限（约 15MB 原始数据）
 
@@ -202,22 +194,9 @@ function sortModels(models: PoolModel[]): PoolModel[] {
 // 从 OpenRouter 拉取并构建池
 // ---------------------------------------------------------------------------
 
-/** 拉取 OpenRouter 模型列表（公开接口，无需 key）。 */
-async function fetchOpenRouterModels(baseUrl: string, signal: AbortSignal): Promise<RawORModel[]> {
-  const res = await fetch(`${baseUrl}/models`, {
-    signal,
-    headers: { accept: "application/json" },
-  });
-  if (!res.ok) throw new Error(`OpenRouter /models HTTP ${res.status}`);
-  const payload = (await res.json()) as { data?: RawORModel[] };
-  if (!Array.isArray(payload?.data)) throw new Error("OpenRouter 返回了意外格式");
-  return payload.data;
-}
-
-function isFreeModel(r: RawORModel): boolean {
-  const prompt = r.pricing?.prompt ?? "";
-  const completion = r.pricing?.completion ?? "";
-  return r.id.endsWith(":free") || (prompt === "0" && completion === "0");
+/** 获取 OpenRouter 模型目录：复用 or-free 模块的共享缓存（整个扩展启动只拉取一次网络）。 */
+async function fetchOpenRouterModels(force: boolean): Promise<RawORModel[]> {
+  return getOpenRouterCatalog(force);
 }
 
 /**
@@ -331,8 +310,7 @@ function refreshPool(force: boolean, ctx: ExtensionContext): Promise<PoolState> 
 async function doRefresh(force: boolean, ctx: ExtensionContext): Promise<PoolState> {
   const current = await loadPool();
   if (!force && isFresh(current)) return current;
-  const signal = AbortSignal.timeout(REFRESH_TIMEOUT_MS);
-  const raw = await fetchOpenRouterModels(current.config.openrouterBaseUrl, signal);
+  const raw = await fetchOpenRouterModels(force);
   const { pool, added, removed, restored } = buildPool(current, raw, current.config);
   const merged = await mergeRegistryIntoPool(pool, ctx);
   await savePool(merged.pool);
@@ -626,7 +604,7 @@ function combineSignals(...signals: Array<AbortSignal | undefined>): AbortSignal
 // 扩展主体
 // ---------------------------------------------------------------------------
 
-export default function (pi: ExtensionAPI) {
+export function initVisionPool(pi: ExtensionAPI) {
   // ---- 自动拦截：文本模型 + 图片 → 视觉池描述 ----
   pi.on("input", async (event, ctx) => {
     if (event.source === "extension") return { action: "continue" };
