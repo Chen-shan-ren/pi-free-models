@@ -1,0 +1,939 @@
+/**
+ * vision-pool.ts — 视觉模型池（Vision Pool）扩展
+ *
+ * 解决的问题：
+ *   当当前模型是纯文本模型时，用户上传的图片无法被模型看到。本扩展会在
+ *   用户消息进入 LLM 之前自动拦截：检测到图片 + 当前模型不支持图片输入时，
+ *   自动调用"视觉模型池"中优先级最高的多模态模型（走 OpenRouter API）
+ *   识别图片，并把识别出的文字描述注入消息（原始图片从消息中移除）。
+ *   文本模型看到的是描述文字，完全无需用户或模型手动干预。
+ *
+ * 视觉模型池：
+ *   1. OpenRouter 公开接口 https://openrouter.ai/api/v1/models 中支持图片输入
+ *      （input_modalities 含 image）的免费多模态模型（includePaid=false 时只保留免费），
+ *      缓存到 ~/.pi/agent/vision-pool.json。OpenRouter 的 free 模型会不定期上架/
+ *      下架，因此池需要周期性刷新（见“刷新策略”）。
+ *   2. pi 模型注册表中你自己配置的多模态模型（如 models.json 里自定义的
+ *      xiaomi-clean/mimo-v2.5、sensenova-6.x 等，includeRegistryModels=true 时自动纳入），
+ *      调用时直接走 pi 自身的模型调用层（鉴权/协议自动处理）。
+ *
+ * 刷新策略（混合式）：
+ *   1. 懒刷新 + TTL：池过期（默认 24h）后，第一次真正需要视觉能力时先刷新再用；
+ *   2. 启动后台刷新：pi 启动时若池已过期，在后台异步刷新（不阻塞启动，离线也能用旧池）；
+ *   3. 手动刷新：/mm-refresh 随时强制刷新；
+ *   4. 失败触发：池中所有候选模型都调用失败（例如免费模型被下架）时，
+ *      自动强制刷新一次并用新池重试。
+ *   之所以不全在启动时刷新：启动刷新会引入网络依赖、拖慢启动，且模型上架
+ *   下架是按天级别的变化；之所以不全在用时刷新：首次使用会慢，且过期池中
+ *   的模型可能已失效。混合策略兼顾新鲜度与启动速度。
+ *
+ * 优先级：
+ *   数字越小越优先（1 = 最高）。默认：免费模型按上下文长度降序排 1..N，
+ *   付费模型排 10000+，即"免费优先"；用户手动设置过的优先级（userSet）
+ *   在每次刷新时保留。下架的模型不会删除，而是标记 offline（⚠），
+ *   不再参与调用，恢复上架后自动解除标记。
+ *
+ * 命令：
+ *   /mm-pool [free|paid|all|offline]  查看模型池（按优先级排序）
+ *   /mm-refresh                       强制从 OpenRouter 刷新模型池
+ *   /mm-priority [数字] [关键字]      设置模型优先级（无参数时交互选择）
+ *   /mm-status                        当前模型与模型池状态
+ *   /mm-config                        查看扩展配置
+ *
+ * 工具（LLM 可调用）：
+ *   describe_image   显式描述一张图片（本地路径 / data URL / 裸 base64）
+ *   mm_pool_info     查询视觉池信息（数量、优先级、免费/付费等）
+ *
+ * 配置（~/.pi/agent/vision-pool.json 的 config 字段，改后 /reload 生效）：
+ *   ttlHours            池过期时间（小时），默认 24
+ *   refreshOnStartup    启动时后台异步刷新，默认 true
+ *   refreshOnAllFailed  全部候选失败时强制刷新重试，默认 true
+ *   freeFirst           免费模型默认排前面，默认 true
+ *   includePaid         池中是否包含付费模型，默认 true
+ *   maxModels           池容量上限，默认 200
+ *   includeRegistryModels  自动把 pi 中已配置鉴权的多模态模型（如自定义的
+ *                      mimo-v2.5）纳入池，默认 true
+ *   describeMaxTokens   识别输出的最大 token，默认 2048
+ *   forceDescribe       即使当前模型支持图片也强制走视觉池，默认 false
+ *   openrouterBaseUrl   OpenRouter API 地址，默认 https://openrouter.ai/api/v1
+ *   describePrompt      发给视觉模型的识别提示词
+ *
+ * 依赖：
+ *   OpenRouter API key —— 自动复用 pi 中 openrouter provider 的凭据
+ *   （/login openrouter 或 OPENROUTER_API_KEY 环境变量），无需额外配置。
+ *   拉取模型列表本身是公开接口，不需要 key。
+ */
+
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+import { join, isAbsolute } from "node:path";
+import { readFile, writeFile, mkdir } from "node:fs/promises";
+
+// ---------------------------------------------------------------------------
+// 类型
+// ---------------------------------------------------------------------------
+
+interface ImageContentLike {
+  type: "image";
+  data: string;
+  mimeType: string;
+}
+
+interface RawORModel {
+  id: string;
+  name?: string;
+  context_length?: number;
+  architecture?: { input_modalities?: string[] };
+  pricing?: { prompt?: string; completion?: string };
+}
+
+interface PoolModel {
+  id: string;
+  name: string;
+  contextLength: number;
+  free: boolean;
+  priority: number; // 1 = 最高
+  userSet?: boolean; // 优先级是否由用户手动设置（刷新时保留）
+  offline?: boolean; // 已从 OpenRouter 下架
+  source?: "openrouter" | "registry"; // 来源：OpenRouter 池 / pi 注册表（自定义模型）
+  provider?: string; // registry 条目的 provider id（如 xiaomi-clean）
+  pricing?: { prompt?: string; completion?: string };
+}
+
+/** pi 注册表中支持图片输入且已配置鉴权的模型（用户自定义/已登录的多模态模型）。 */
+interface RegistryModelInfo {
+  provider: string;
+  id: string;
+  name: string;
+  contextLength: number;
+}
+
+interface PoolConfig {
+  ttlHours: number;
+  refreshOnStartup: boolean;
+  refreshOnAllFailed: boolean;
+  freeFirst: boolean;
+  includePaid: boolean;
+  maxModels: number;
+  describeMaxTokens: number;
+  forceDescribe: boolean;
+  openrouterBaseUrl: string;
+  describePrompt: string;
+}
+
+interface PoolState {
+  updatedAt: number;
+  models: PoolModel[];
+  config: PoolConfig;
+}
+
+// ---------------------------------------------------------------------------
+// 常量与默认配置
+// ---------------------------------------------------------------------------
+
+const POOL_FILE = join(getAgentDir(), "vision-pool.json");
+const REFRESH_TIMEOUT_MS = 30_000;
+const DESCRIBE_TIMEOUT_MS = 120_000;
+const MAX_IMAGE_BYTES = 20 * 1024 * 1024; // base64 上限（约 15MB 原始数据）
+
+const DEFAULT_CONFIG: PoolConfig = {
+  ttlHours: 24,
+  refreshOnStartup: true,
+  refreshOnAllFailed: true,
+  freeFirst: true,
+  includePaid: false,
+  includeRegistryModels: true,
+  maxModels: 200,
+  describeMaxTokens: 2048,
+  forceDescribe: false,
+  openrouterBaseUrl: "https://openrouter.ai/api/v1",
+  describePrompt:
+    "你是图片识别代理。请用中文详细描述用户提供的图片内容：包括可见的文字（原样转录）、界面/布局、图表数据、颜色、物体与场景等所有重要细节。若有多张图片，请按图片顺序逐张描述，并分别标注“图片 1”、“图片 2”。只输出描述本身，不要输出任何解释或前言。",
+};
+
+// ---------------------------------------------------------------------------
+// 池文件读写
+// ---------------------------------------------------------------------------
+
+async function loadPool(): Promise<PoolState> {
+  try {
+    const raw = await readFile(POOL_FILE, "utf8");
+    const parsed = JSON.parse(raw) as Partial<PoolState>;
+    if (parsed && Array.isArray(parsed.models)) {
+      return {
+        updatedAt: typeof parsed.updatedAt === "number" ? parsed.updatedAt : 0,
+        models: parsed.models.filter((m) => m && typeof m.id === "string"),
+        config: { ...DEFAULT_CONFIG, ...(parsed.config ?? {}) },
+      };
+    }
+  } catch {
+    // 首次运行或文件损坏：返回空池
+  }
+  return { updatedAt: 0, models: [], config: { ...DEFAULT_CONFIG } };
+}
+
+async function savePool(pool: PoolState): Promise<void> {
+  try {
+    await mkdir(join(getAgentDir()), { recursive: true });
+    await writeFile(POOL_FILE, JSON.stringify(pool, null, 2), "utf8");
+  } catch (err) {
+    throw new Error(`无法写入池文件 ${POOL_FILE}: ${errMsg(err)}`);
+  }
+}
+
+function isFresh(pool: PoolState): boolean {
+  return (
+    pool.models.length > 0 &&
+    Date.now() - pool.updatedAt < pool.config.ttlHours * 3_600_000
+  );
+}
+
+function sortModels(models: PoolModel[]): PoolModel[] {
+  return [...models].sort(
+    (a, b) =>
+      Number(!!a.offline) - Number(!!b.offline) ||
+      a.priority - b.priority ||
+      a.id.localeCompare(b.id),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 从 OpenRouter 拉取并构建池
+// ---------------------------------------------------------------------------
+
+/** 拉取 OpenRouter 模型列表（公开接口，无需 key）。 */
+async function fetchOpenRouterModels(baseUrl: string, signal: AbortSignal): Promise<RawORModel[]> {
+  const res = await fetch(`${baseUrl}/models`, {
+    signal,
+    headers: { accept: "application/json" },
+  });
+  if (!res.ok) throw new Error(`OpenRouter /models HTTP ${res.status}`);
+  const payload = (await res.json()) as { data?: RawORModel[] };
+  if (!Array.isArray(payload?.data)) throw new Error("OpenRouter 返回了意外格式");
+  return payload.data;
+}
+
+function isFreeModel(r: RawORModel): boolean {
+  const prompt = r.pricing?.prompt ?? "";
+  const completion = r.pricing?.completion ?? "";
+  return r.id.endsWith(":free") || (prompt === "0" && completion === "0");
+}
+
+/**
+ * 用最新数据重建池：
+ * - 在线模型：保留旧优先级（用户设置过的永久保留，默认值重新计算）
+ * - 下架模型：不删除，标记 offline（恢复上架后自动解除）
+ */
+function buildPool(
+  current: PoolState,
+  raw: RawORModel[],
+  config: PoolConfig,
+): { pool: PoolState; added: string[]; removed: string[]; restored: string[] } {
+  const prevById = new Map(current.models.map((m) => [m.id, m]));
+  const rawIds = new Set(raw.map((r) => r.id)); // 用于区分“被配置排除”与“真下架”
+  const free: PoolModel[] = [];
+  const paid: PoolModel[] = [];
+
+  for (const r of raw) {
+    const modalities = (r.architecture?.input_modalities ?? []).map((s) =>
+      String(s).toLowerCase(),
+    );
+    if (!modalities.includes("image")) continue; // 只保留多模态（图片输入）模型
+    const freeModel = isFreeModel(r);
+    if (!freeModel && !config.includePaid) continue;
+    const prev = prevById.get(r.id);
+    const model: PoolModel = {
+      id: r.id,
+      name: r.name ?? r.id,
+      contextLength: r.context_length ?? 0,
+      free: freeModel,
+      priority: prev?.priority ?? (freeModel ? 0 : 10000), // 临时值，下面重排
+      userSet: prev?.userSet,
+      offline: false,
+      pricing: r.pricing,
+    };
+    (freeModel ? free : paid).push(model);
+  }
+
+  // 默认优先级：freeFirst=true 时免费模型排 1..N（上下文长度降序）、付费排 10000+i；
+  // freeFirst=false 时全部按上下文长度统一排 1..N。用户设置过的优先级不受影响。
+  const byCtx = (a: PoolModel, b: PoolModel) =>
+    b.contextLength - a.contextLength || a.id.localeCompare(b.id);
+  if (config.freeFirst) {
+    free.sort(byCtx);
+    paid.sort(byCtx);
+    free.forEach((m, i) => {
+      if (!m.userSet) m.priority = i + 1;
+    });
+    paid.forEach((m, i) => {
+      if (!m.userSet) m.priority = 10000 + i + 1;
+    });
+  } else {
+    const allNew = [...free, ...paid].sort(byCtx);
+    allNew.forEach((m, i) => {
+      if (!m.userSet) m.priority = i + 1;
+    });
+  }
+
+  // 下架的旧模型：保留并标记 offline。被配置排除的（如 includePaid=false 时的付费模型）
+  // 不属于下架，直接从池中移除，不算 ⚠下架；注册表条目由 mergeRegistryIntoPool 管理。
+  const offlineModels: PoolModel[] = [];
+  for (const prev of current.models) {
+    if (prev.source === "registry") continue;
+    if (!free.some((m) => m.id === prev.id) && !paid.some((m) => m.id === prev.id)) {
+      if (rawIds.has(prev.id)) continue; // 仍在 OpenRouter 上，只是被配置排除
+      offlineModels.push({ ...prev, offline: true });
+    }
+  }
+
+  let all = sortModels([...free, ...paid, ...offlineModels]);
+
+  // 容量上限：优先保留用户设置过优先级的模型
+  if (config.maxModels > 0 && all.length > config.maxModels) {
+    const keep: PoolModel[] = all.filter((m) => m.userSet);
+    for (const m of all) {
+      if (keep.length >= config.maxModels) break;
+      if (!keep.includes(m)) keep.push(m);
+    }
+    all = keep;
+  }
+
+  // 统计差异（在截断之后统计，避免把被容量上限排除的模型误报为“新增”）
+  const added: string[] = [];
+  const removed: string[] = [];
+  const restored: string[] = [];
+  for (const m of all) {
+    const prev = prevById.get(m.id);
+    if (!m.offline) {
+      if (!prev) added.push(m.id);
+      else if (prev.offline) restored.push(m.id);
+    } else if (prev && !prev.offline) {
+      removed.push(m.id);
+    }
+  }
+
+  return { pool: { ...current, updatedAt: Date.now(), models: all }, added, removed, restored };
+}
+
+let refreshing: Promise<PoolState> | null = null;
+
+/** 刷新池（并发合并：同一时刻只发一个请求）。force=true 时忽略 TTL。 */
+function refreshPool(force: boolean, ctx: ExtensionContext): Promise<PoolState> {
+  if (!force && refreshing) return refreshing;
+  const task = doRefresh(force, ctx).finally(() => {
+    refreshing = null;
+  });
+  refreshing = task;
+  return task;
+}
+
+async function doRefresh(force: boolean, ctx: ExtensionContext): Promise<PoolState> {
+  const current = await loadPool();
+  if (!force && isFresh(current)) return current;
+  const signal = AbortSignal.timeout(REFRESH_TIMEOUT_MS);
+  const raw = await fetchOpenRouterModels(current.config.openrouterBaseUrl, signal);
+  const { pool, added, removed, restored } = buildPool(current, raw, current.config);
+  const merged = await mergeRegistryIntoPool(pool, ctx);
+  await savePool(merged.pool);
+  console.log(
+    `[vision-pool] refreshed: ${merged.pool.models.filter((m) => !m.offline).length} online multimodal models` +
+      ` (added ${added.length}, removed ${removed.length}, restored ${restored.length})`,
+  );
+  return merged.pool;
+}
+
+/** 获取可用池：新鲜直接返回，否则懒刷新（失败时退回旧池）。每次都会同步注册表条目。 */
+async function ensureFreshPool(ctx: ExtensionContext): Promise<PoolState> {
+  const pool = await loadPool();
+  const merged = await mergeRegistryIntoPool(pool, ctx);
+  if (merged.changed) await savePool(merged.pool);
+  if (isFresh(merged.pool)) return merged.pool;
+  try {
+    return await refreshPool(false, ctx);
+  } catch {
+    return merged.pool; // 刷新失败不阻塞使用旧池
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 注册表（自定义模型）同步
+// ---------------------------------------------------------------------------
+
+/** 从 pi 模型注册表找出支持图片输入、已配置鉴权的模型（OpenRouter 除外，它由 REST 路径覆盖）。 */
+function getRegistryMultimodalModels(ctx: ExtensionContext): RegistryModelInfo[] {
+  try {
+    const registry = ctx.modelRegistry;
+    return registry
+      .getAll()
+      .filter((m) => m.provider !== "openrouter")
+      .filter((m) => m.input.includes("image"))
+      .filter((m) => {
+        try {
+          return registry.hasConfiguredAuth(m);
+        } catch {
+          return false;
+        }
+      })
+      .map((m) => ({
+        provider: m.provider,
+        id: m.id,
+        name: m.name,
+        contextLength: m.contextWindow,
+      }));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * 把注册表中的多模态模型同步进池：新增条目（默认优先级 100+i，排在免费 OpenRouter
+ * 模型之后）、保留用户设置的优先级、移除已不在注册表中的条目。
+ */
+async function mergeRegistryIntoPool(
+  pool: PoolState,
+  ctx: ExtensionContext,
+): Promise<{ pool: PoolState; changed: boolean }> {
+  if (!pool.config.includeRegistryModels) return { pool, changed: false };
+  const registry = getRegistryMultimodalModels(ctx);
+  const oldRegistry = pool.models.filter((m) => m.source === "registry");
+  const oldByKey = new Map(oldRegistry.map((m) => [`${m.provider}/${m.id}`, m]));
+
+  const sorted = [...registry].sort(
+    (a, b) => b.contextLength - a.contextLength || a.id.localeCompare(b.id),
+  );
+  const synced: PoolModel[] = [];
+  let changed = oldRegistry.length !== sorted.length;
+  for (const r of sorted) {
+    const key = `${r.provider}/${r.id}`;
+    const prev = oldByKey.get(key);
+    if (prev) {
+      if (prev.name !== r.name || prev.contextLength !== r.contextLength) changed = true;
+      synced.push({ ...prev, name: r.name, contextLength: r.contextLength, offline: false });
+    } else {
+      changed = true;
+      synced.push({
+        id: r.id,
+        name: r.name,
+        contextLength: r.contextLength,
+        free: false,
+        priority: 100 + synced.length,
+        source: "registry",
+        provider: r.provider,
+      });
+    }
+  }
+  const keptOthers = pool.models.filter((m) => m.source !== "registry");
+  return { pool: { ...pool, models: sortModels([...keptOthers, ...synced]) }, changed };
+}
+
+// ---------------------------------------------------------------------------
+// 调用视觉模型
+// ---------------------------------------------------------------------------
+
+async function getOpenRouterApiKey(ctx: ExtensionContext): Promise<string | undefined> {
+  try {
+    const key = await ctx.modelRegistry.getApiKeyForProvider("openrouter");
+    if (key) return key;
+  } catch {
+    // 走环境变量兜底
+  }
+  return process.env.OPENROUTER_API_KEY;
+}
+
+async function callOpenRouter(
+  config: PoolConfig,
+  apiKey: string,
+  modelId: string,
+  images: ImageContentLike[],
+  prompt: string,
+  signal: AbortSignal,
+): Promise<string> {
+  const content: unknown[] = [{ type: "text", text: prompt }];
+  for (const img of images) {
+    if (!img.data) continue;
+    if (img.data.length > MAX_IMAGE_BYTES * 1.34) {
+      throw new Error("图片过大（base64 超过 20MB）");
+    }
+    content.push({
+      type: "image_url",
+      image_url: { url: `data:${img.mimeType || "image/png"};base64,${img.data}` },
+    });
+  }
+  if (content.length <= 1) throw new Error("没有可用的图片数据");
+
+  const res = await fetch(`${config.openrouterBaseUrl}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${apiKey}`,
+      "x-title": "pi vision-pool",
+    },
+    body: JSON.stringify({
+      model: modelId,
+      messages: [{ role: "user", content }],
+      max_tokens: config.describeMaxTokens,
+    }),
+    signal,
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`HTTP ${res.status} ${body.slice(0, 160)}`);
+  }
+  const payload = (await res.json()) as {
+    choices?: Array<{ message?: { content?: unknown } }>;
+  };
+  const out = payload?.choices?.[0]?.message?.content;
+  if (typeof out === "string") return out;
+  if (Array.isArray(out)) {
+    return out
+      .map((p) => (typeof p?.text === "string" ? p.text : ""))
+      .join("");
+  }
+  throw new Error("模型返回了空响应");
+}
+
+/**
+ * 通过 pi 的模型调用层调用注册表中的模型（自动处理鉴权/协议，如 xiaomi-clean/mimo-v2.5）。
+ */
+async function callRegistryModel(
+  ctx: ExtensionContext,
+  entry: PoolModel,
+  images: ImageContentLike[],
+  prompt: string,
+  signal: AbortSignal,
+): Promise<string> {
+  const model = ctx.modelRegistry.find(entry.provider!, entry.id);
+  if (!model) throw new Error(`模型 ${entry.provider}/${entry.id} 未在注册表中`);
+  const config = (await loadPool()).config;
+  const content: unknown[] = [{ type: "text", text: prompt }];
+  for (const img of images) {
+    if (!img.data) continue;
+    content.push({ type: "image", data: img.data, mimeType: img.mimeType || "image/png" });
+  }
+  const message = { role: "user" as const, content, timestamp: Date.now() };
+  const result = await ctx.modelRegistry.complete(model, { messages: [message] } as never, {
+    signal,
+    maxTokens: config.describeMaxTokens,
+  });
+  if (result.errorMessage) throw new Error(result.errorMessage);
+  const text = (result.content ?? [])
+    .filter((c) => c.type === "text")
+    .map((c) => (c as { text: string }).text)
+    .join("\n")
+    .trim();
+  if (!text) throw new Error("模型返回了空响应");
+  return text;
+}
+
+/**
+ * 按优先级依次调用池中模型（OpenRouter REST 与注册表模型混排），直到成功。
+ * 全部失败时：若配置允许，强制刷新池（处理免费模型被下架的情况）后重试一次。
+ */
+async function describeImages(
+  ctx: ExtensionContext,
+  images: ImageContentLike[],
+  promptOverride?: string,
+  signal?: AbortSignal,
+): Promise<{ text: string; modelId: string }> {
+  const pool = await ensureFreshPool(ctx);
+  const config = pool.config;
+  const apiKey = await getOpenRouterApiKey(ctx);
+  if (!apiKey) {
+    throw new Error("未找到 OpenRouter API key（请运行 /login openrouter 或设置 OPENROUTER_API_KEY）");
+  }
+  const prompt = promptOverride ?? config.describePrompt;
+  const timeout = signal ?? AbortSignal.timeout(DESCRIBE_TIMEOUT_MS);
+  const tried = new Set<string>();
+  const errors: string[] = [];
+
+  const attempt = async (candidates: PoolModel[]) => {
+    for (const m of candidates) {
+      if (m.offline || tried.has(m.id)) continue;
+      tried.add(m.id);
+      try {
+        const text =
+          m.source === "registry"
+            ? await callRegistryModel(ctx, m, images, prompt, timeout)
+            : await callOpenRouter(config, apiKey, m.id, images, prompt, timeout);
+        const modelId = m.source === "registry" ? `${m.provider}/${m.id}` : m.id;
+        return { text, modelId };
+      } catch (err) {
+        errors.push(`${m.source === "registry" ? `${m.provider}/${m.id}` : m.id}: ${errMsg(err)}`);
+      }
+    }
+    return undefined;
+  };
+
+  let result = await attempt(pool.models);
+  if (!result && config.refreshOnAllFailed) {
+    try {
+      const fresh = await refreshPool(true, ctx);
+      result = await attempt(fresh.models);
+    } catch (err) {
+      errors.push(`刷新池失败: ${errMsg(err)}`);
+    }
+  }
+  if (!result) throw new Error(`视觉池所有模型均调用失败：${errors.join("；")}`);
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// 工具函数
+// ---------------------------------------------------------------------------
+
+function errMsg(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function fmtContext(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${Math.round(n / 1_000)}k`;
+  return String(n);
+}
+
+function extToMime(path: string): string | undefined {
+  const ext = path.split(".").pop()?.toLowerCase();
+  switch (ext) {
+    case "png": return "image/png";
+    case "jpg":
+    case "jpeg": return "image/jpeg";
+    case "gif": return "image/gif";
+    case "webp": return "image/webp";
+    case "bmp": return "image/bmp";
+    case "svg": return "image/svg+xml";
+    default: return undefined;
+  }
+}
+
+/** 合并 abort signal：任一触发即中止；无 signal 时返回静默信号。 */
+function combineSignals(...signals: Array<AbortSignal | undefined>): AbortSignal {
+  const present = signals.filter((s): s is AbortSignal => !!s);
+  if (present.length === 0) return new AbortController().signal;
+  if (present.length === 1) return present[0];
+  const anyFn = (AbortSignal as unknown as { any?: (sigs: AbortSignal[]) => AbortSignal }).any;
+  if (typeof anyFn === "function") return anyFn(present);
+  const ctrl = new AbortController();
+  for (const s of present) {
+    if (s.aborted) {
+      ctrl.abort();
+      break;
+    }
+    s.addEventListener("abort", () => ctrl.abort(), { once: true });
+  }
+  return ctrl.signal;
+}
+
+// ---------------------------------------------------------------------------
+// 扩展主体
+// ---------------------------------------------------------------------------
+
+export default function (pi: ExtensionAPI) {
+  // ---- 自动拦截：文本模型 + 图片 → 视觉池描述 ----
+  pi.on("input", async (event, ctx) => {
+    if (event.source === "extension") return { action: "continue" };
+    const images = event.images;
+    if (!images || images.length === 0) return { action: "continue" };
+
+    const model = ctx.model;
+    const multimodal = !!model && model.input.includes("image");
+    const config = (await loadPool()).config;
+    if (multimodal && !config.forceDescribe) return { action: "continue" };
+
+    const modelLabel = model ? `${model.provider}/${model.id}` : "(未知模型)";
+    ctx.ui.notify(
+      `[vision-pool] 当前模型 ${modelLabel} 不支持图片输入，自动调用视觉池描述 ${images.length} 张图片…`,
+      "info",
+    );
+
+    const signal = combineSignals(ctx.signal, AbortSignal.timeout(DESCRIBE_TIMEOUT_MS));
+    try {
+      const result = await describeImages(ctx, images, undefined, signal);
+      const parts: string[] = [];
+      if (event.text.trim()) parts.push(event.text.trim());
+      parts.push("");
+      parts.push(
+        "> 📷 用户上传的图片已自动交给视觉模型池识别（当前模型不支持图片输入，原图已移除，替换为以下描述）：",
+      );
+      parts.push("");
+      parts.push(`**图片描述**（由 \`${result.modelId}\` 识别）：`);
+      parts.push(result.text);
+      return { action: "transform", text: parts.join("\n"), images: [] };
+    } catch (err) {
+      ctx.ui.notify(
+        `[vision-pool] 自动描述失败，原图照常透传（若当前模型不支持图片将报错）：${errMsg(err)}`,
+        "warning",
+      );
+      return { action: "continue" };
+    }
+  });
+
+  // ---- 启动后台刷新（不阻塞启动） ----
+  pi.on("session_start", async (_event, ctx) => {
+    const pool = await loadPool();
+    if (!pool.config.refreshOnStartup || isFresh(pool)) return;
+    refreshPool(false, ctx)
+      .then((fresh) => {
+        const online = fresh.models.filter((m) => !m.offline);
+        const offline = fresh.models.length - online.length;
+        ctx.ui.notify(
+          `[vision-pool] 模型池已更新：${online.length} 个多模态模型` +
+            (offline > 0 ? `（${offline} 个已下架）` : ""),
+          "info",
+        );
+      })
+      .catch((err) =>
+        ctx.ui.notify(`[vision-pool] 后台刷新失败（用到时会按需重试）：${errMsg(err)}`, "warning"),
+      );
+  });
+
+  // ---- 命令：/mm-pool ----
+  pi.registerCommand("mm-pool", {
+    description: "查看视觉模型池（按优先级排序）。可选参数：free / paid / all / offline",
+    handler: async (args, ctx) => {
+      const filter = (args || "").trim().toLowerCase();
+      const pool = await ensureFreshPool(ctx);
+      if (pool.models.length === 0) {
+        ctx.ui.notify("视觉池为空，请先运行 /mm-refresh", "warning");
+        return;
+      }
+      const online = pool.models.filter((m) => !m.offline);
+      const registryCount = online.filter((m) => m.source === "registry").length;
+      const list = sortModels(pool.models).filter((m) => {
+        if (filter === "free") return !m.offline && m.free;
+        if (filter === "paid") return !m.offline && !m.free && m.source !== "registry";
+        if (filter === "offline") return m.offline;
+        if (filter === "all") return true;
+        return !m.offline; // 默认只看在线
+      });
+      const lines = [
+        `视觉模型池：在线 ${online.length} 个（免费 ${online.filter((m) => m.free).length}，` +
+          `自定义 ${registryCount}），下架 ${pool.models.length - online.length} 个，` +
+          `更新于 ${pool.updatedAt ? new Date(pool.updatedAt).toLocaleString() : "从未"}`,
+        `设置优先级：/mm-priority [数字] [关键字]（数字越小越优先；默认免费模型在前）`,
+        ``,
+        ...list.map(
+          (m, i) =>
+            `${String(i + 1).padStart(3)}. [${String(m.priority).padStart(5)}] ` +
+            `${m.offline ? "⚠下架" : m.source === "registry" ? "自定义" : m.free ? "FREE" : "paid"} ` +
+            `${m.source === "registry" ? `${m.provider}/${m.id}` : m.id}  ` +
+            `ctx=${fmtContext(m.contextLength)}${m.userSet ? "  [自定义优先级]" : ""}`,
+        ),
+      ];
+      if (ctx.mode === "tui") {
+        await ctx.ui.editor("视觉模型池", lines.join("\n"));
+        ctx.ui.notify(
+          `视觉池：在线 ${online.length} 个（免费 ${online.filter((m) => m.free).length}），已打开列表`,
+          "info",
+        );
+      } else {
+        ctx.ui.notify(lines.slice(0, 2).join(" | "), "info");
+      }
+    },
+  });
+
+  // ---- 命令：/mm-refresh ----
+  pi.registerCommand("mm-refresh", {
+    description: "强制从 OpenRouter 刷新视觉模型池（免费模型可能不定期上架/下架）",
+    handler: async (_args, ctx) => {
+      ctx.ui.notify("正在从 OpenRouter 刷新视觉模型池…", "info");
+      try {
+        const prev = await loadPool();
+        const beforeOnline = new Set(prev.models.filter((m) => !m.offline).map((m) => m.id));
+        const pool = await refreshPool(true, ctx);
+        const online = pool.models.filter((m) => !m.offline);
+        const added = online.filter((m) => !beforeOnline.has(m.id));
+        const nowOffline = pool.models.filter((m) => m.offline);
+        const delisted = nowOffline.filter((m) => beforeOnline.has(m.id));
+        const restored = nowOffline.filter((m) => !beforeOnline.has(m.id)).length;
+        ctx.ui.notify(
+          `视觉池已刷新：在线 ${online.length} 个多模态模型` +
+            `（免费 ${online.filter((m) => m.free).length}），新增 ${added.length}，` +
+            `本次下架 ${delisted.length} 个${restored > 0 ? `，恢复 ${restored} 个` : ""}`,
+          "info",
+        );
+      } catch (err) {
+        ctx.ui.notify(`刷新失败：${errMsg(err)}`, "error");
+      }
+    },
+  });
+
+  // ---- 命令：/mm-priority ----
+  pi.registerCommand("mm-priority", {
+    description: "设置视觉池模型优先级（数字越小越优先）。用法：/mm-priority [数字] [模型关键字]",
+    handler: async (args, ctx) => {
+      const pool = await ensureFreshPool(ctx);
+      const online = pool.models.filter((m) => !m.offline);
+      if (online.length === 0) {
+        ctx.ui.notify("视觉池为空，请先运行 /mm-refresh", "warning");
+        return;
+      }
+      const trimmed = (args || "").trim();
+      let priority: number | undefined;
+      let keyword = "";
+      const m = trimmed.match(/^(\d{1,5})\s+(.+)$/);
+      if (m) {
+        priority = parseInt(m[1], 10);
+        keyword = m[2].toLowerCase();
+      } else if (/^\d{1,5}$/.test(trimmed)) {
+        priority = parseInt(trimmed, 10);
+      } else {
+        keyword = trimmed.toLowerCase();
+      }
+
+      const matches = keyword
+        ? online.filter(
+            (mm) =>
+              mm.id.toLowerCase().includes(keyword) ||
+              (mm.source === "registry" &&
+                `${mm.provider}/${mm.id}`.toLowerCase().includes(keyword)) ||
+              (mm.name ?? "").toLowerCase().includes(keyword),
+          )
+        : online;
+      if (matches.length === 0) {
+        ctx.ui.notify(`没有找到匹配“${keyword}”的模型`, "warning");
+        return;
+      }
+
+      let target: PoolModel | undefined;
+      if (matches.length === 1) {
+        target = matches[0];
+      } else {
+        const picked = await ctx.ui.select(
+          `选择模型（${matches.length} 个匹配）：`,
+          matches.map((mm) => `[${mm.priority}] ${mm.id}`),
+        );
+        target = matches.find((mm) => `[${mm.priority}] ${mm.id}` === picked);
+      }
+      if (!target) return;
+
+      if (priority === undefined) {
+        const input = await ctx.ui.input("优先级（数字越小越优先）", String(target.priority));
+        if (input === undefined || input.trim() === "") return;
+        priority = parseInt(input.trim(), 10);
+        if (Number.isNaN(priority)) {
+          ctx.ui.notify("优先级必须是数字", "warning");
+          return;
+        }
+      }
+
+      pool.models = pool.models.map((mm) =>
+        mm.id === target!.id ? { ...mm, priority, userSet: true } : mm,
+      );
+      await savePool(pool);
+      ctx.ui.notify(`已设置 ${target!.id} 的优先级为 ${priority}`, "info");
+    },
+  });
+
+  // ---- 命令：/mm-status ----
+  pi.registerCommand("mm-status", {
+    description: "查看当前模型与视觉池状态",
+    handler: async (_args, ctx) => {
+      const model = ctx.model;
+      const pool = await ensureFreshPool(ctx);
+      const online = pool.models.filter((m) => !m.offline);
+      const key = await getOpenRouterApiKey(ctx);
+      const registryCount = online.filter((m) => m.source === "registry").length;
+      const lines = [
+        `当前模型：${model ? `${model.provider}/${model.id}` : "(未设置)"}`,
+        `支持图片输入：${model ? (model.input.includes("image") ? "是 ✅" : "否 ❌（上传图片时将自动走视觉池）") : "未知"}`,
+        `视觉池：在线 ${online.length} 个多模态模型（免费 ${online.filter((m) => m.free).length}，自定义 ${registryCount}），下架 ${pool.models.length - online.length} 个`,
+        `上次更新：${pool.updatedAt ? new Date(pool.updatedAt).toLocaleString() : "从未"}（${isFresh(pool) ? "新鲜" : "已过期，将按需刷新"}）`,
+        `OpenRouter API key：${key ? "已配置 ✅" : "未配置 ❌（运行 /login openrouter 或设置 OPENROUTER_API_KEY）"}`,
+        `自动描述开关：${pool.config.forceDescribe ? "始终强制走视觉池" : "仅文本模型上传图片时触发"}`,
+        `注册表多模态模型：${registryCount > 0 ? `已纳入 ${registryCount} 个（如 xiaomi-clean/mimo-v2.5）` : "无（在 models.json 或 /login 配置后自动纳入）"}`,
+      ];
+      if (ctx.mode === "tui") await ctx.ui.editor("vision-pool 状态", lines.join("\n"));
+      else ctx.ui.notify(lines.join(" | "), "info");
+    },
+  });
+
+  // ---- 命令：/mm-config ----
+  pi.registerCommand("mm-config", {
+    description: "查看 vision-pool 配置（修改：编辑 vision-pool.json 的 config 后 /reload）",
+    handler: async (_args, ctx) => {
+      const config = (await loadPool()).config;
+      const text = `vision-pool 配置（修改：编辑 ${POOL_FILE} 的 config 字段后 /reload）\n\n${JSON.stringify(config, null, 2)}`;
+      if (ctx.mode === "tui") await ctx.ui.editor("vision-pool 配置", text);
+      else ctx.ui.notify("vision-pool 配置已打印（TUI 模式下打开编辑器）", "info");
+    },
+  });
+
+  // ---- 工具：describe_image ----
+  pi.registerTool({
+    name: "describe_image",
+    label: "Describe Image",
+    description:
+      "通过视觉模型池描述一张图片的内容。image 参数可以是本地图片路径、data:image/...;base64,xxx 数据 URL 或裸 base64 字符串；prompt 可自定义描述要求。注意：用户上传图片时若当前模型不支持图片，系统会自动描述，无需调用本工具。",
+    parameters: Type.Object({
+      image: Type.String({ description: "本地图片路径 / data URL / 裸 base64" }),
+      prompt: Type.Optional(Type.String({ description: "自定义描述指令" })),
+    }),
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      let img: ImageContentLike;
+      if (params.image.startsWith("data:image/")) {
+        const m = params.image.match(/^data:(image\/[\w.+-]+);base64,(.+)$/s);
+        if (!m) throw new Error("无法解析 data URL");
+        img = { type: "image", mimeType: m[1], data: m[2] };
+      } else if (params.image.length > 100 && /^[A-Za-z0-9+/=\s]+$/.test(params.image)) {
+        img = { type: "image", mimeType: "image/png", data: params.image.replace(/\s/g, "") };
+      } else {
+        const path = isAbsolute(params.image) ? params.image : join(ctx.cwd, params.image);
+        const buf = await readFile(path);
+        img = {
+          type: "image",
+          mimeType: extToMime(params.image) ?? "image/png",
+          data: buf.toString("base64"),
+        };
+      }
+      onUpdate?.({ content: [{ type: "text", text: "正在通过视觉模型池识别图片…" }] });
+      const config = (await loadPool()).config;
+      const prompt = params.prompt
+        ? `${config.describePrompt}\n\n用户自定义要求：${params.prompt}`
+        : config.describePrompt;
+      const result = await describeImages(ctx, [img], prompt, signal);
+      return {
+        content: [{ type: "text", text: `[由 ${result.modelId} 识别]\n${result.text}` }],
+        details: { modelId: result.modelId },
+      };
+    },
+  });
+
+  // ---- 工具：mm_pool_info ----
+  pi.registerTool({
+    name: "mm_pool_info",
+    label: "Vision Pool Info",
+    description:
+      "查看视觉模型池（支持图片输入的多模态模型）的信息：总数、免费数、更新时间和按优先级排序的模型列表。当用户询问有哪些多模态模型/视觉模型可用时使用。",
+    parameters: Type.Object({
+      limit: Type.Optional(Type.Integer({ description: "返回前 N 个模型，默认 20" })),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const pool = await ensureFreshPool(ctx);
+      const online = sortModels(pool.models).filter((m) => !m.offline);
+      const limit = Math.min(Math.max(params.limit ?? 20, 1), 200);
+      const top = online.slice(0, limit).map((m) => ({
+        id: m.source === "registry" ? `${m.provider}/${m.id}` : m.id,
+        priority: m.priority,
+        free: m.free,
+        source: m.source ?? "openrouter",
+        contextLength: m.contextLength,
+      }));
+      const text = JSON.stringify(
+        {
+          count: online.length,
+          free: online.filter((m) => m.free).length,
+          custom: online.filter((m) => m.source === "registry").length,
+          updatedAt: pool.updatedAt ? new Date(pool.updatedAt).toISOString() : null,
+          top: top,
+        },
+        null,
+        2,
+      );
+      return {
+        content: [{ type: "text", text }],
+        details: { count: online.length },
+      };
+    },
+  });
+}
