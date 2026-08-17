@@ -273,9 +273,10 @@ LLM 对未公布上下文的模型填保守估计值（131072）。如果你知�
 
 ```
 pi-wanchuan/              # 复制整个目录到 ~/.pi/agent/extensions/
-├── index.ts                 # 入口（协调三个模块）
+├── index.ts                 # 入口（协调四个模块）
 ├── or-free.ts               # 共享数据层（拉取/缓存/防并发）+ 免费 provider 注册
 ├── vision-pool.ts           # 视觉模型池（自动看图 + AI 自动发现）
+├── image-gen.ts             # 图像生成池
 └── filter-providers.ts      # 内置 provider 模型筛选（nvidia/cloudflare/zai 只留旗舰）
 ```
 
@@ -286,6 +287,7 @@ pi-wanchuan/              # 复制整个目录到 ~/.pi/agent/extensions/
 | 版本 | 内容 |
 |------|------|
 | 2026-08 | 合并 openrouter-free + vision-pool 为 pi-wanchuan（共享数据层，一次拉取） |
+| 2026-08 | 改名 pi-wanchuan（万川），slogan：百川东到海；新增图像生成池 |
 | 2026-08 | 新增内置 provider 筛选（nvidia / cloudflare-workers-ai / zai 只保留旗舰模型） |
 | 2026-08 | 新增 AI 自动发现（autoDiscover：服务商 /models + LLM 分析 + 带图片实测验证） |
 
