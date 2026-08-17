@@ -64,7 +64,23 @@ cp -r pi-free-models ~/.pi/agent/extensions/
 /mm-priority 1 xiaomi-clean/mimo-v2.5   # 把自定义模型调到最高优先级
 /mm-priority 3 gemini                   # 按关键字设置
 /mm-pool free                           # 只看免费模型
+/mm-discover                            # AI 自动发现（需先开启 autoDiscover）
 ```
+
+## 🤖 AI 自动发现（autoDiscover）
+
+默认关闭。开启后，视觉池会读取你 `models.json` 中配置的模型服务商（有 baseUrl + API key 的），
+逐个调用它们的 `/models` 接口，用你的模型（`discoverModel` 指定或当前激活模型）分析出多模态模型，
+然后**带图片实测验证**（过滤掉图像生成/编辑等假多模态），通过后才加入池。
+
+```json
+{ "config": { "autoDiscover": true } }
+```
+
+- 首次运行自动做一次全量发现；之后 `/mm-refresh` 时增量发现新模型
+- 也可手动 `/mm-discover`（增量）或 `/mm-discover full`（全量）
+- 生成的模型走服务商自己的 OpenAI 兼容端点调用（`discovered` 来源）
+- 注意：分析会消耗你的模型少量 token（每次发现 1 次调用 + 每模型 1 次验证）
 
 ## 🎯 特点
 
@@ -90,6 +106,9 @@ cp -r pi-free-models ~/.pi/agent/extensions/
 | `maxModels` | 200 | 池容量上限 |
 | `describeMaxTokens` | 2048 | 识别输出最大 token |
 | `forceDescribe` | false | 即使当前模型支持图片也强制走视觉池 |
+| `autoDiscover` | false | **AI 自动发现**：读取用户 models.json 配置的服务商，调其 /models 接口，用你的模型分析多模态模型并带图片实测验证后加入池（首次运行全量，之后刷新时增量） |
+| `discoverModel` | 空 | 用于分析的模型（`provider/model`，空=用当前激活模型） |
+| `discoverFreeOnly` | false | 严格模式：只收录 LLM 判定为免费的新模型（LLM 判断不可靠，默认收全部，免费标记只影响优先级） |
 | `openrouterBaseUrl` | `https://openrouter.ai/api/v1` | OpenRouter API 地址 |
 | `describePrompt` | （中文描述提示词） | 发给视觉模型的识别提示词 |
 
