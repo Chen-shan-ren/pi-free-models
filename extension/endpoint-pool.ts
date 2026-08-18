@@ -232,9 +232,10 @@ async function sendEndpointRequest(
       signal,
     });
   }
-  const text = await res.text().catch(() => "");
-  const buffer = res.ok ? Buffer.from(await res.arrayBuffer().catch(() => Buffer.from(""))) : undefined;
-  return { status: res.status, text, buffer };
+  // 先读 body 字节，再转文本（text() 会消费响应体，音频/JSON 都从字节取）
+  const bytes = res.ok ? Buffer.from(await res.arrayBuffer().catch(() => Buffer.from(""))) : undefined;
+  const text = bytes ? bytes.toString("utf8") : await res.text().catch(() => "");
+  return { status: res.status, text, buffer: bytes };
 }
 
 /** 从用户服务商发现某类池的模型（关键词候选 + 端点验证）。返回新增数量。 */
@@ -300,55 +301,94 @@ interface BuiltinCandidate {
   models: Array<{ id: string; body?: Record<string, unknown> }>;
 }
 
-/** 嵌入池的内置免费候选（已验证可用的免费额度模型） */
-const BUILTIN_EMBED_CANDIDATES: BuiltinCandidate[] = [
-  {
-    provider: "cloudflare-workers-ai",
-    keyEnv: "CLOUDFLARE_API_KEY",
-    baseUrl: () => {
-      const acc = getEnvValue("CLOUDFLARE_ACCOUNT_ID");
-      return acc ? `https://api.cloudflare.com/client/v4/accounts/${acc}/ai/v1` : undefined;
+/** 已知可用的免费端点模型候选（OpenRouter 隐藏模型 + 内置服务商） */
+const BUILTIN_CANDIDATES: Record<PoolKind, BuiltinCandidate[]> = {
+  embed: [
+    {
+      provider: "openrouter",
+      keyEnv: "OPENROUTER_API_KEY",
+      baseUrl: () => "https://openrouter.ai/api/v1",
+      models: [
+        { id: "nvidia/nemotron-3-embed-1b:free" },
+        { id: "nvidia/llama-nemotron-embed-vl-1b-v2:free" },
+      ],
     },
-    models: [
-      { id: "@cf/baai/bge-base-en-v1.5" },
-      { id: "@cf/baai/bge-small-en-v1.5" },
-      { id: "@cf/baai/bge-m3" },
-    ],
-  },
-  {
-    provider: "nvidia",
-    keyEnv: "NVIDIA_API_KEY",
-    baseUrl: () => "https://integrate.api.nvidia.com/v1",
-    models: [
-      { id: "nvidia/nv-embed-v1" },
-      { id: "nvidia/embed-qa-4" },
-      { id: "nvidia/nv-embedqa-e5-v5", body: { input_type: "query" } },
-    ],
-  },
-];
+    {
+      provider: "cloudflare-workers-ai",
+      keyEnv: "CLOUDFLARE_API_KEY",
+      baseUrl: () => {
+        const acc = getEnvValue("CLOUDFLARE_ACCOUNT_ID");
+        return acc ? `https://api.cloudflare.com/client/v4/accounts/${acc}/ai/v1` : undefined;
+      },
+      models: [
+        { id: "@cf/baai/bge-base-en-v1.5" },
+        { id: "@cf/baai/bge-small-en-v1.5" },
+        { id: "@cf/baai/bge-m3" },
+      ],
+    },
+    {
+      provider: "nvidia",
+      keyEnv: "NVIDIA_API_KEY",
+      baseUrl: () => "https://integrate.api.nvidia.com/v1",
+      models: [
+        { id: "nvidia/nv-embed-v1" },
+        { id: "nvidia/embed-qa-4" },
+        { id: "nvidia/nv-embedqa-e5-v5", body: { input_type: "query" } },
+      ],
+    },
+  ],
+  tts: [
+    {
+      provider: "openrouter",
+      keyEnv: "OPENROUTER_API_KEY",
+      baseUrl: () => "https://openrouter.ai/api/v1",
+      models: [
+        { id: "deepgram/flux-tts:free" },
+        { id: "fish-audio/s2.1-pro-free:free" },
+      ],
+    },
+  ],
+  asr: [],
+};
 
-/** 发现内置服务商的免费候选（当前仅嵌入池有）并入池。返回新增数量。 */
+/** TTS 等端点：400 时从错误信息提取支持的 voice 并重试（自动适配）。 */
+async function sendWithVoiceAdapt(baseUrl: string, apiKey: string, kind: PoolKind, m: { id: string; body?: Record<string, unknown> }, signal: AbortSignal): Promise<{ status: number; text: string; buffer?: Buffer }> {
+  let body = { model: m.id, input: "hi", voice: kind === "tts" ? "alloy" : undefined, ...(m.body ?? {}) };
+  let r = await sendEndpointRequest(baseUrl, apiKey, kind, m.id, body, signal);
+  if (r.status === 400 && kind === "tts" && r.text.includes("Supported voices")) {
+    const names = r.text.match(/[a-z0-9-]+-en|[a-z0-9]+-[a-z0-9]+-en|[a-z0-9-]+/g) ?? [];
+    const voice = names.find((v) => /-en$/.test(v) || v.includes("-"));
+    if (voice) {
+      body = { model: m.id, input: "hi", voice, ...(m.body ?? {}) };
+      r = await sendEndpointRequest(baseUrl, apiKey, kind, m.id, body, signal);
+    }
+  }
+  return r;
+}
+
+/** 发现已知免费端点模型候选（OpenRouter 隐藏模型 + 内置服务商）并入池。返回新增数量。 */
 async function discoverBuiltinCandidates(kind: PoolKind): Promise<number> {
-  if (kind !== "embed") return 0;
+  const candidates = BUILTIN_CANDIDATES[kind];
+  if (candidates.length === 0) return 0;
   const pool = await loadPool(kind);
   const poolIds = new Set(pool.models.map((m) => m.id));
   let added = 0;
-  for (const c of BUILTIN_EMBED_CANDIDATES) {
+  for (const c of candidates) {
     const apiKey = getEnvValue(c.keyEnv);
     const baseUrl = c.baseUrl();
     if (!apiKey || !baseUrl) continue;
     for (const m of c.models) {
       if (poolIds.has(m.id)) continue;
       try {
-        const body = { model: m.id, input: "hi", ...(m.body ?? {}) };
-        const r = await sendEndpointRequest(baseUrl, apiKey, "embed", m.id, body, AbortSignal.timeout(20_000));
-        if (!KIND_SPECS.embed.verifyOk(r.status, r.text)) continue;
+        const r = await sendWithVoiceAdapt(baseUrl, apiKey, kind, m, AbortSignal.timeout(20_000));
+        try { require("node:fs").appendFileSync("C:/Users/Ds/ep-debug.log", "cand " + m.id + " status=" + r.status + " text=" + r.text.slice(0, 60) + "\n"); } catch (e2) {}
+        if (!KIND_SPECS[kind].verifyOk(r.status, r.text)) continue;
         const maxP = Math.max(0, ...pool.models.map((mm) => mm.priority));
         pool.models.push({
           id: m.id,
           provider: c.provider,
           baseUrl,
-          apiKeyRef: `${c.keyEnv}`,
+          apiKeyRef: `$${c.keyEnv}`,
           priority: maxP + 1,
         });
         poolIds.add(m.id);
@@ -399,14 +439,16 @@ async function synthesizeSpeech(
   const m = findModel(pool);
   if (!m) throw new Error("TTS 池为空，请先运行 /tts-discover");
   const key = m.apiKeyRef?.startsWith("$") ? getEnvValue(m.apiKeyRef.slice(1)) : undefined;
-  const r = await sendEndpointRequest(
-    m.baseUrl,
-    key ?? "",
-    "tts",
-    m.id,
-    { model: m.id, input: text, voice: "alloy", response_format: "mp3" },
-    signal ?? AbortSignal.timeout(120_000),
-  );
+  let body: Record<string, unknown> = { model: m.id, input: text, voice: "alloy", response_format: "mp3" };
+  let r = await sendEndpointRequest(m.baseUrl, key ?? "", "tts", m.id, body, signal ?? AbortSignal.timeout(120_000));
+  if (r.status === 400 && r.text.includes("Supported voices")) {
+    const names = r.text.match(/[a-z0-9-]+-en|[a-z0-9]+-[a-z0-9]+-en|[a-z0-9-]+/g) ?? [];
+    const voice = names.find((v) => /-en$/.test(v) || v.includes("-"));
+    if (voice) {
+      body = { model: m.id, input: text, voice, response_format: "mp3" };
+      r = await sendEndpointRequest(m.baseUrl, key ?? "", "tts", m.id, body, signal ?? AbortSignal.timeout(120_000));
+    }
+  }
   if (r.status !== 200 || !r.buffer || r.buffer.length === 0) {
     throw new Error(`HTTP ${r.status} ${r.text.slice(0, 150)}`);
   }
