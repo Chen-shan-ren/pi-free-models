@@ -25,7 +25,7 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { join } from "node:path";
+import { join, isAbsolute } from "node:path";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
@@ -676,7 +676,9 @@ export function initImageGen(pi: ExtensionAPI): void {
       const result = await generateImage(ctx, params.prompt, signal);
       let finalPath = result.path;
       if (params.outputPath) {
-        const target = join(ctx.cwd, params.outputPath);
+        const target = isAbsolute(params.outputPath)
+          ? params.outputPath
+          : join(ctx.cwd, params.outputPath);
         await mkdir(join(target, ".."), { recursive: true }).catch(() => {});
         await writeFile(target, Buffer.from(await readFile(result.path)));
         finalPath = target;

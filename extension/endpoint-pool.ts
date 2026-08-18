@@ -20,7 +20,7 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { join } from "node:path";
+import { join, isAbsolute } from "node:path";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
@@ -880,7 +880,10 @@ export function initEndpointPools(pi: ExtensionAPI): void {
       audioPath: Type.String({ description: "音频文件路径（wav/mp3 等）" }),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      const r = await transcribeAudio(ctx, params.audioPath, signal);
+      const resolvedPath = isAbsolute(params.audioPath)
+        ? params.audioPath
+        : join(ctx.cwd, params.audioPath);
+      const r = await transcribeAudio(ctx, resolvedPath, signal);
       return {
         content: [{ type: "text", text: `转录结果（${r.model}）：\n${r.text}` }],
         details: { model: r.model },
