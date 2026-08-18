@@ -793,6 +793,40 @@ export function initEndpointPools(pi: ExtensionAPI): void {
     })();
   });
 
+  // ---- ASR 自动拦截：用户消息里的音频文件路径 → 自动转录（像图片自动描述一样） ----
+  pi.on("input", async (event, ctx) => {
+    if (event.source === "extension" || ctx.mode === "print") return { action: "continue" };
+    const text = event.text ?? "";
+    if (!text.trim()) return { action: "continue" };
+    const audioPool = await loadPool("asr");
+    if (audioPool.models.length === 0) return { action: "continue" };
+    // 匹配常见音频文件路径（含 Windows/Unix 路径与中文文件名）
+    const m = text.match(/[\w:/.\\\-\u4e00-\u9fff]+?\.(?:wav|mp3|m4a|flac|ogg|aac|opus)\b/i);
+    if (!m) return { action: "continue" };
+    const audioPath = m[0].trim();
+    try {
+      await import("node:fs/promises").then((f) => f.access(audioPath));
+    } catch {
+      return { action: "continue" }; // 文件不存在：不拦截
+    }
+    ctx.ui.notify("[wanchuan] 检测到音频文件，自动转录…", "info");
+    try {
+      const r = await transcribeAudio(ctx, audioPath);
+      const newText =
+        text +
+        "\n\n> 🎙️ 音频 " +
+        audioPath +
+        " 已自动转录（" +
+        r.model +
+        "）：\n" +
+        r.text;
+      return { action: "transform", text: newText };
+    } catch (err) {
+      ctx.ui.notify("[wanchuan] 自动转录失败（可手动 /asr 重试）：" + errMsg(err), "warning");
+      return { action: "continue" };
+    }
+  });
+
   // ---- 工具 ----
   pi.registerTool({
     name: "embed_text",
@@ -820,6 +854,8 @@ export function initEndpointPools(pi: ExtensionAPI): void {
     name: "text_to_speech",
     label: "Text to Speech",
     description: "通过 TTS 池把文本合成为语音文件（mp3，保存到 Downloads）。需先 /tts-discover。",
+    promptSnippet: "朗读/读出文本，生成语音文件",
+    promptGuidelines: ["当用户要求朗读、读出、语音播放某段文本或回复时，使用 text_to_speech 工具合成语音文件并告知保存路径。"],
     parameters: Type.Object({
       text: Type.String({ description: "要朗读的文本" }),
     }),
@@ -836,6 +872,8 @@ export function initEndpointPools(pi: ExtensionAPI): void {
     name: "transcribe_audio",
     label: "Transcribe Audio",
     description: "通过 ASR 池把音频文件转为文本。需先 /asr-discover。",
+    promptSnippet: "转写/听写音频文件",
+    promptGuidelines: ["当用户提供音频文件路径并要求转写内容时，使用 transcribe_audio 工具（用户消息中的音频路径通常已被自动转录，仅当自动转录失败或用户明确要求时使用本工具）。"],
     parameters: Type.Object({
       audioPath: Type.String({ description: "音频文件路径（wav/mp3 等）" }),
     }),
