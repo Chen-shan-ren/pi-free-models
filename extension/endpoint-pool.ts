@@ -149,17 +149,30 @@ function resolvePoolKey(apiKeyRef: string | undefined): string | undefined {
   return getEnvValue(name);
 }
 
-/** 小米 MiMo key：优先 MIMO_API_KEY 环境变量，回退 auth.json 的 xiaomi-clean 凭据。 */
+/** 小米 MiMo key：MIMO_API_KEY env → auth.json 的 xiaomi-clean →
+ *  models.json 中 baseUrl 含 xiaomimimo.com 的任意 provider（兼容自定义命名）。 */
 function getXiaomiKey(): string | undefined {
   const env = getEnvValue("MIMO_API_KEY");
   if (env) return env;
   try {
     const auth = JSON.parse(readFileSync(join(getAgentDir(), "auth.json"), "utf8"));
     const v = auth?.["xiaomi-clean"]?.key;
-    return typeof v === "string" && v ? v : undefined;
+    if (typeof v === "string" && v) return v;
   } catch {
-    return undefined;
+    // 继续尝试 models.json
   }
+  try {
+    const cfg = JSON.parse(readFileSync(join(getAgentDir(), "models.json"), "utf8"));
+    for (const def of Object.values(cfg?.providers ?? {})) {
+      const base = typeof def?.baseUrl === "string" ? def.baseUrl : "";
+      if (!base.includes("xiaomimimo.com")) continue;
+      const k = resolveApiKey(def?.apiKey);
+      if (k) return k;
+    }
+  } catch {
+    // 无 models.json
+  }
+  return undefined;
 }
 
 function resolveApiKey(config: unknown): string | undefined {
@@ -754,6 +767,31 @@ export function initEndpointPools(pi: ExtensionAPI): void {
   for (const kind of ["embed", "tts", "asr"] as PoolKind[]) {
     registerKindCommands(pi, kind);
   }
+
+  // ---- 首次运行自动发现：池为空且已配置对应 key 时，后台自动发现（新用户开箱即用） ----
+  pi.on("session_start", (_event, ctx) => {
+    if (ctx.mode === "print") return;
+    void (async () => {
+      for (const kind of ["embed", "tts", "asr"] as PoolKind[]) {
+        try {
+          const pool = await loadPool(kind);
+          if (pool.models.length > 0) continue;
+          const hasKey =
+            kind === "embed"
+              ? !!(getEnvValue("OPENROUTER_API_KEY") ||
+                  getEnvValue("CLOUDFLARE_API_KEY") ||
+                  getEnvValue("NVIDIA_API_KEY"))
+              : kind === "tts"
+                ? !!(getEnvValue("OPENROUTER_API_KEY") || getXiaomiKey())
+                : !!getXiaomiKey();
+          if (!hasKey) continue;
+          await discoverKind(ctx, kind);
+        } catch {
+          // 静默：发现失败不影响启动
+        }
+      }
+    })();
+  });
 
   // ---- 工具 ----
   pi.registerTool({
