@@ -22,6 +22,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Type } from "typebox";
 import { join } from "node:path";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
 // ---------------------------------------------------------------------------
@@ -148,6 +149,19 @@ function resolvePoolKey(apiKeyRef: string | undefined): string | undefined {
   return getEnvValue(name);
 }
 
+/** 小米 MiMo key：优先 MIMO_API_KEY 环境变量，回退 auth.json 的 xiaomi-clean 凭据。 */
+function getXiaomiKey(): string | undefined {
+  const env = getEnvValue("MIMO_API_KEY");
+  if (env) return env;
+  try {
+    const auth = JSON.parse(readFileSync(join(getAgentDir(), "auth.json"), "utf8"));
+    const v = auth?.["xiaomi-clean"]?.key;
+    return typeof v === "string" && v ? v : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function resolveApiKey(config: unknown): string | undefined {
   if (typeof config !== "string" || !config) return undefined;
   const m = config.match(/^\$(.+)$/);
@@ -165,7 +179,6 @@ interface UserProvider {
 function readUserProviders(): UserProvider[] {
   const out: UserProvider[] = [];
   try {
-    const { readFileSync } = require("node:fs") as typeof import("node:fs");
     const raw = readFileSync(join(getAgentDir(), "models.json"), "utf8");
     const cfg = JSON.parse(raw) as {
       providers?: Record<string, { name?: string; baseUrl?: string; apiKey?: string }>;
@@ -339,6 +352,12 @@ const BUILTIN_CANDIDATES: Record<PoolKind, BuiltinCandidate[]> = {
   ],
   tts: [
     {
+      provider: "xiaomi-clean",
+      keyEnv: "MIMO_API_KEY",
+      baseUrl: () => "https://api.xiaomimimo.com/v1",
+      models: [{ id: "mimo-v2.5-tts" }],
+    },
+    {
       provider: "openrouter",
       keyEnv: "OPENROUTER_API_KEY",
       baseUrl: () => "https://openrouter.ai/api/v1",
@@ -348,7 +367,14 @@ const BUILTIN_CANDIDATES: Record<PoolKind, BuiltinCandidate[]> = {
       ],
     },
   ],
-  asr: [],
+  asr: [
+    {
+      provider: "xiaomi-clean",
+      keyEnv: "MIMO_API_KEY",
+      baseUrl: () => "https://api.xiaomimimo.com/v1",
+      models: [{ id: "mimo-v2.5-asr" }],
+    },
+  ],
 };
 
 /** TTS 等端点：400 时从错误信息提取支持的 voice 并重试（自动适配）。 */
@@ -366,7 +392,72 @@ async function sendWithVoiceAdapt(baseUrl: string, apiKey: string, kind: PoolKin
   return r;
 }
 
-/** 发现已知免费端点模型候选（OpenRouter 隐藏模型 + 内置服务商）并入池。返回新增数量。 */
+/** 小米验证：TTS/ASR 走 chat/completions 特殊格式（api-key header）。 */
+async function verifyXiaomi(kind: PoolKind, key: string): Promise<boolean> {
+  try {
+    const headers = { "Content-Type": "application/json", "api-key": key };
+    const base = "https://api.xiaomimimo.com/v1/chat/completions";
+    let body: unknown;
+    if (kind === "tts") {
+      body = {
+        model: "mimo-v2.5-tts",
+        messages: [
+          { role: "user", content: "正常语速，中文朗读" },
+          { role: "assistant", content: "你好。" },
+        ],
+        audio: { format: "wav", voice: "Chloe" },
+      };
+    } else {
+      // 真实正弦波 wav（1 秒 440Hz）：小米 ASR 对静音音频返回 500
+      const sr = 16000;
+      const n = sr;
+      const samples = Buffer.alloc(n * 2);
+      for (let i = 0; i < n; i++) {
+        samples.writeInt16LE(Math.round(Math.sin((2 * Math.PI * 440 * i) / sr) * 8000), i * 2);
+      }
+      const header = Buffer.alloc(44);
+      header.write("RIFF", 0);
+      header.writeUInt32LE(36 + samples.length, 4);
+      header.write("WAVE", 8);
+      header.write("fmt ", 12);
+      header.writeUInt32LE(16, 16);
+      header.writeUInt16LE(1, 20);
+      header.writeUInt16LE(1, 22);
+      header.writeUInt32LE(sr, 24);
+      header.writeUInt32LE(sr * 2, 28);
+      header.writeUInt16LE(2, 32);
+      header.writeUInt16LE(16, 34);
+      header.write("data", 36);
+      header.writeUInt32LE(samples.length, 40);
+      const wav = Buffer.concat([header, samples]);
+      body = {
+        model: "mimo-v2.5-asr",
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "input_audio", input_audio: { data: "data:audio/wav;base64," + wav.toString("base64") } },
+            ],
+          },
+        ],
+      };
+    }
+    const r = await fetch(base, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(30_000),
+    });
+    const t = await r.text();
+    if (r.status !== 200) return false;
+    if (kind === "tts") return t.includes("audio") && t.includes("UklGR");
+    return t.includes("content");
+  } catch {
+    return false;
+  }
+}
+
+/** 发现已知免费端点模型候选（OpenRouter 隐藏模型 + 内置服务商 + 小米特殊格式）并入池。返回新增数量。 */
 async function discoverBuiltinCandidates(kind: PoolKind): Promise<number> {
   const candidates = BUILTIN_CANDIDATES[kind];
   if (candidates.length === 0) return 0;
@@ -374,15 +465,19 @@ async function discoverBuiltinCandidates(kind: PoolKind): Promise<number> {
   const poolIds = new Set(pool.models.map((m) => m.id));
   let added = 0;
   for (const c of candidates) {
-    const apiKey = getEnvValue(c.keyEnv);
+    const apiKey = c.provider === "xiaomi-clean" ? getXiaomiKey() : getEnvValue(c.keyEnv);
     const baseUrl = c.baseUrl();
     if (!apiKey || !baseUrl) continue;
     for (const m of c.models) {
       if (poolIds.has(m.id)) continue;
       try {
-        const r = await sendWithVoiceAdapt(baseUrl, apiKey, kind, m, AbortSignal.timeout(20_000));
-        try { require("node:fs").appendFileSync("C:/Users/Ds/ep-debug.log", "cand " + m.id + " status=" + r.status + " text=" + r.text.slice(0, 60) + "\n"); } catch (e2) {}
-        if (!KIND_SPECS[kind].verifyOk(r.status, r.text)) continue;
+        if (c.provider === "xiaomi-clean") {
+          const ok = await verifyXiaomi(kind, apiKey);
+          if (!ok) continue;
+        } else {
+          const r = await sendWithVoiceAdapt(baseUrl, apiKey, kind, m, AbortSignal.timeout(20_000));
+          if (!KIND_SPECS[kind].verifyOk(r.status, r.text)) continue;
+        }
         const maxP = Math.max(0, ...pool.models.map((mm) => mm.priority));
         pool.models.push({
           id: m.id,
@@ -438,7 +533,35 @@ async function synthesizeSpeech(
   const pool = await loadPool("tts");
   const m = findModel(pool);
   if (!m) throw new Error("TTS 池为空，请先运行 /tts-discover");
-  const key = m.apiKeyRef?.startsWith("$") ? getEnvValue(m.apiKeyRef.slice(1)) : undefined;
+  if (m.provider === "xiaomi-clean") {
+    const key = getXiaomiKey();
+    if (!key) throw new Error("未找到小米 API key（MIMO_API_KEY 或 auth.json xiaomi-clean）");
+    const r = await fetch("https://api.xiaomimimo.com/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "api-key": key },
+      body: JSON.stringify({
+        model: "mimo-v2.5-tts",
+        messages: [
+          { role: "user", content: "正常语速，中文朗读，发音清晰" },
+          { role: "assistant", content: text },
+        ],
+        audio: { format: "wav", voice: "Chloe" },
+      }),
+      signal: signal ?? AbortSignal.timeout(120_000),
+    });
+    const t = await r.text();
+    if (r.status !== 200) throw new Error("HTTP " + r.status + " " + t.slice(0, 150));
+    const j = JSON.parse(t) as { choices?: Array<{ message?: { audio?: { data?: string } } }> };
+    const audioData = j.choices?.[0]?.message?.audio?.data;
+    if (!audioData) throw new Error("响应中没有音频数据");
+    const outDir = join(process.env.USERPROFILE ?? process.env.HOME ?? ".", "Downloads");
+    await mkdir(outDir, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const file = join(outDir, "wanchuan-tts-" + stamp + ".wav");
+    await writeFile(file, Buffer.from(audioData, "base64"));
+    return { path: file, model: "mimo-v2.5-tts" };
+  }
+  const key = resolvePoolKey(m.apiKeyRef);
   let body: Record<string, unknown> = { model: m.id, input: text, voice: "alloy", response_format: "mp3" };
   let r = await sendEndpointRequest(m.baseUrl, key ?? "", "tts", m.id, body, signal ?? AbortSignal.timeout(120_000));
   if (r.status === 400 && r.text.includes("Supported voices")) {
@@ -469,7 +592,32 @@ async function transcribeAudio(
   const pool = await loadPool("asr");
   const m = findModel(pool);
   if (!m) throw new Error("ASR 池为空，请先运行 /asr-discover");
-  const key = m.apiKeyRef?.startsWith("$") ? getEnvValue(m.apiKeyRef.slice(1)) : undefined;
+  if (m.provider === "xiaomi-clean") {
+    const key = getXiaomiKey();
+    if (!key) throw new Error("未找到小米 API key（MIMO_API_KEY 或 auth.json xiaomi-clean）");
+    const buf = await readFile(audioPath);
+    const r = await fetch("https://api.xiaomimimo.com/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "api-key": key },
+      body: JSON.stringify({
+        model: "mimo-v2.5-asr",
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "input_audio", input_audio: { data: "data:audio/wav;base64," + buf.toString("base64") } },
+            ],
+          },
+        ],
+      }),
+      signal: signal ?? AbortSignal.timeout(120_000),
+    });
+    const t = await r.text();
+    if (r.status !== 200) throw new Error("HTTP " + r.status + " " + t.slice(0, 150));
+    const j = JSON.parse(t) as { choices?: Array<{ message?: { content?: string } }> };
+    return { text: j.choices?.[0]?.message?.content ?? "", model: "mimo-v2.5-asr" };
+  }
+  const key = resolvePoolKey(m.apiKeyRef);
   const buf = await readFile(audioPath);
   const fd = new FormData();
   fd.append("model", m.id);
