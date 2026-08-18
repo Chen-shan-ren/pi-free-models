@@ -34,6 +34,10 @@
 | 🆓 **免费 Provider** | openrouter 提供商只保留免费模型（定价 0/0），`/model` 干净清爽 |
 | 🔄 **自动刷新** | 免费列表变化频繁（每周甚至更勤），缓存 6h 自动重拉；失败自动回退缓存 |
 | 📷 **自动看图** | 文本模型收到图片时，自动调用视觉池最高优先级的多模态模型描述 |
+| 🖼️ **图像生成池** | `/img-generate <提示词>` 或 `generate_image` 工具：按优先级生成图片，保存到本地 |
+| 🔢 **嵌入池** | `/embed <文本>` 或 `embed_text` 工具：文本 → 向量（相似度/检索） |
+| 🎙️ **TTS 池** | `/tts <文本>` 或 `text_to_speech` 工具：文本 → 语音文件 |
+| 🗣️ **ASR 池** | `/asr <音频>` 或 `transcribe_audio` 工具：音频 → 文本 |
 | 🎯 **优先级管理** | 免费优先、性能其次；手动优先级刷新后保留 |
 | 🤖 **AI 自动发现** | 读取你配置的模型服务商，用你的模型分析多模态模型并实测验证后入池 |
 | 🛡️ **容错设计** | 下架感知、失败自动刷新重试、网络失败回退缓存 |
@@ -185,6 +189,11 @@ pi 启动 ──► 拉取 OpenRouter 全量目录（或读 6h 内缓存）
 | `/mm-refresh` | 强制刷新视觉池（免费模型不定期上架/下架） |
 | `/mm-priority [数字] [关键字]` | 设置模型优先级（无参数时交互选择） |
 | `/mm-discover [full]` | AI 自动发现（增量 / 全量） |
+| `/img-pool` · `/img-refresh` · `/img-priority` | 图像生成池管理 |
+| `/img-generate <提示词>` | 生成图片并保存（默认 Downloads 目录） |
+| `/embed-pool` · `/embed-discover` · `/embed <文本>` | 嵌入池：查看 / 发现 / 文本转向量 |
+| `/tts-pool` · `/tts-discover` · `/tts <文本>` | TTS 池：查看 / 发现 / 文本转语音 |
+| `/asr-pool` · `/asr-discover` · `/asr <音频>` | ASR 池：查看 / 发现 / 音频转文本 |
 | `/mm-status` | 当前模型、视觉池、API key、自动发现状态 |
 | `/mm-config` | 查看视觉池配置 |
 
@@ -193,6 +202,8 @@ pi 启动 ──► 拉取 OpenRouter 全量目录（或读 6h 内缓存）
 | 工具 | 说明 |
 |------|------|
 | `describe_image` | 显式描述图片（本地路径 / data URL / 裸 base64） |
+| `generate_image` | 生成图片（走图像生成池，保存到本地） |
+| `embed_text` / `text_to_speech` / `transcribe_audio` | 嵌入 / TTS / ASR（走端点池） |
 | `mm_pool_info` | 查询视觉池信息（数量、优先级、免费/付费等） |
 
 ---
@@ -273,10 +284,11 @@ LLM 对未公布上下文的模型填保守估计值（131072）。如果你知�
 
 ```
 pi-wanchuan/              # 复制整个目录到 ~/.pi/agent/extensions/
-├── index.ts                 # 入口（协调四个模块）
+├── index.ts                 # 入口（协调五个模块）
 ├── or-free.ts               # 共享数据层（拉取/缓存/防并发）+ 免费 provider 注册
 ├── vision-pool.ts           # 视觉模型池（自动看图 + AI 自动发现）
 ├── image-gen.ts             # 图像生成池
+├── endpoint-pool.ts         # 嵌入/TTS/ASR 端点池（服务商发现 + 实测验证）
 └── filter-providers.ts      # 内置 provider 模型筛选（nvidia/cloudflare/zai 只留旗舰）
 ```
 
@@ -288,6 +300,7 @@ pi-wanchuan/              # 复制整个目录到 ~/.pi/agent/extensions/
 |------|------|
 | 2026-08 | 合并 openrouter-free + vision-pool 为 pi-wanchuan（共享数据层，一次拉取） |
 | 2026-08 | 改名 pi-wanchuan（万川），slogan：百川东到海；新增图像生成池 |
+| 2026-08 | 新增嵌入/TTS/ASR 端点池（服务商发现 + 端点实测验证） |
 | 2026-08 | 新增内置 provider 筛选（nvidia / cloudflare-workers-ai / zai 只保留旗舰模型） |
 | 2026-08 | 新增 AI 自动发现（autoDiscover：服务商 /models + LLM 分析 + 带图片实测验证） |
 
