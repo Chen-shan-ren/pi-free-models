@@ -860,12 +860,22 @@ export function initEndpointPools(pi: ExtensionAPI): void {
     promptGuidelines: ["当用户要求朗读、读出、语音播放某段文本或回复时，使用 text_to_speech 工具合成语音文件并告知保存路径。"],
     parameters: Type.Object({
       text: Type.String({ description: "要朗读的文本" }),
+      outputPath: Type.Optional(Type.String({ description: "保存路径（默认 Downloads）" })),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const r = await synthesizeSpeech(ctx, params.text, signal);
+      let finalPath = r.path;
+      if (params.outputPath) {
+        const target = isAbsolute(params.outputPath)
+          ? params.outputPath
+          : join(ctx.cwd, params.outputPath);
+        await mkdir(join(target, ".."), { recursive: true }).catch(() => {});
+        await writeFile(target, Buffer.from(await readFile(r.path)));
+        finalPath = target;
+      }
       return {
-        content: [{ type: "text", text: `语音已保存：${r.path}（模型：${r.model}）` }],
-        details: { path: r.path, model: r.model },
+        content: [{ type: "text", text: `语音已保存：${finalPath}（模型：${r.model}）` }],
+        details: { path: finalPath, model: r.model },
       };
     },
   });
