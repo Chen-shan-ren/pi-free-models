@@ -390,6 +390,8 @@ export function initImageGen(pi: ExtensionAPI): void {
     label: "Generate Image",
     description:
       "通过图像生成池生成一张图片并保存到本地。prompt 为图片描述；outputPath 可选（默认 Downloads 目录）。返回保存路径。注意：图像生成模型需要付费额度。",
+      promptSnippet: "生成图片（AI 绘图）",
+      promptGuidelines: ["当用户要求画图、生成图片、绘图、制作插画/海报/logo 等图像生成需求时，使用 generate_image 工具（提示词要详细：主体、风格、构图、细节）。生成会消耗付费额度。"],
     parameters: Type.Object({
       prompt: Type.String({ description: "图片内容描述" }),
       outputPath: Type.Optional(Type.String({ description: "保存路径（默认 Downloads）" })),

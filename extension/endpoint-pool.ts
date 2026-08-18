@@ -833,6 +833,8 @@ export function initEndpointPools(pi: ExtensionAPI): void {
     label: "Embed Text",
     description:
       "通过嵌入池把文本转为向量（返回维度与前几维）。嵌入池需先 /embed-discover 发现可用模型。可用于相似度/检索场景。",
+      promptSnippet: "文本转向量（相似度/检索）",
+      promptGuidelines: ["当用户询问文本相似度、语义比较、向量表示、聚类、检索等场景时，使用 embed_text 工具计算向量。"],
     parameters: Type.Object({
       text: Type.String({ description: "要嵌入的文本" }),
     }),
