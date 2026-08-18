@@ -141,6 +141,13 @@ function getEnvValue(name: string): string | undefined {
   }
 }
 
+/** 解析池条目里的 key 引用：兼容 $"NAME" 与 "NAME" 两种格式。 */
+function resolvePoolKey(apiKeyRef: string | undefined): string | undefined {
+  if (!apiKeyRef) return undefined;
+  const name = apiKeyRef.startsWith("$") ? apiKeyRef.slice(1) : apiKeyRef;
+  return getEnvValue(name);
+}
+
 function resolveApiKey(config: unknown): string | undefined {
   if (typeof config !== "string" || !config) return undefined;
   const m = config.match(/^\$(.+)$/);
@@ -277,6 +284,84 @@ async function discoverKind(ctx: ExtensionContext, kind: PoolKind): Promise<numb
     pool.updatedAt = Date.now();
     await savePool(kind, pool);
   }
+  // 内置服务商免费候选（嵌入池：Cloudflare bge / NVIDIA nv-embed）
+  added += await discoverBuiltinCandidates(kind);
+  return added;
+}
+
+// ---------------------------------------------------------------------------
+// 内置服务商免费候选（端点验证后入池，不依赖 /models 列表）
+// ---------------------------------------------------------------------------
+
+interface BuiltinCandidate {
+  provider: string;
+  keyEnv: string;
+  baseUrl: () => string | undefined;
+  models: Array<{ id: string; body?: Record<string, unknown> }>;
+}
+
+/** 嵌入池的内置免费候选（已验证可用的免费额度模型） */
+const BUILTIN_EMBED_CANDIDATES: BuiltinCandidate[] = [
+  {
+    provider: "cloudflare-workers-ai",
+    keyEnv: "CLOUDFLARE_API_KEY",
+    baseUrl: () => {
+      const acc = getEnvValue("CLOUDFLARE_ACCOUNT_ID");
+      return acc ? `https://api.cloudflare.com/client/v4/accounts/${acc}/ai/v1` : undefined;
+    },
+    models: [
+      { id: "@cf/baai/bge-base-en-v1.5" },
+      { id: "@cf/baai/bge-small-en-v1.5" },
+      { id: "@cf/baai/bge-m3" },
+    ],
+  },
+  {
+    provider: "nvidia",
+    keyEnv: "NVIDIA_API_KEY",
+    baseUrl: () => "https://integrate.api.nvidia.com/v1",
+    models: [
+      { id: "nvidia/nv-embed-v1" },
+      { id: "nvidia/embed-qa-4" },
+      { id: "nvidia/nv-embedqa-e5-v5", body: { input_type: "query" } },
+    ],
+  },
+];
+
+/** 发现内置服务商的免费候选（当前仅嵌入池有）并入池。返回新增数量。 */
+async function discoverBuiltinCandidates(kind: PoolKind): Promise<number> {
+  if (kind !== "embed") return 0;
+  const pool = await loadPool(kind);
+  const poolIds = new Set(pool.models.map((m) => m.id));
+  let added = 0;
+  for (const c of BUILTIN_EMBED_CANDIDATES) {
+    const apiKey = getEnvValue(c.keyEnv);
+    const baseUrl = c.baseUrl();
+    if (!apiKey || !baseUrl) continue;
+    for (const m of c.models) {
+      if (poolIds.has(m.id)) continue;
+      try {
+        const body = { model: m.id, input: "hi", ...(m.body ?? {}) };
+        const r = await sendEndpointRequest(baseUrl, apiKey, "embed", m.id, body, AbortSignal.timeout(20_000));
+        if (!KIND_SPECS.embed.verifyOk(r.status, r.text)) continue;
+        const maxP = Math.max(0, ...pool.models.map((mm) => mm.priority));
+        pool.models.push({
+          id: m.id,
+          provider: c.provider,
+          baseUrl,
+          apiKeyRef: `${c.keyEnv}`,
+          priority: maxP + 1,
+        });
+        poolIds.add(m.id);
+        added++;
+      } catch {
+        // 跳过
+      }
+    }
+  }
+  if (added > 0) {
+    pool.updatedAt = Date.now();
+    await savePool(kind, pool);
+  }
   return added;
 }
 
@@ -295,7 +380,7 @@ async function embedText(ctx: ExtensionContext, text: string, signal?: AbortSign
   const pool = await loadPool("embed");
   const m = findModel(pool);
   if (!m) throw new Error("嵌入池为空，请先运行 /embed-discover");
-  const key = m.apiKeyRef?.startsWith("$") ? getEnvValue(m.apiKeyRef.slice(1)) : undefined;
+  const key = resolvePoolKey(m.apiKeyRef);
   const r = await sendEndpointRequest(m.baseUrl, key ?? "", "embed", m.id, { model: m.id, input: text }, signal ?? AbortSignal.timeout(60_000));
   if (r.status !== 200) throw new Error(`HTTP ${r.status} ${r.text.slice(0, 150)}`);
   const j = JSON.parse(r.text) as { data?: Array<{ embedding?: number[] }> };
