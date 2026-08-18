@@ -888,8 +888,15 @@ async function describeImages(
         let text: string;
         if (m.source === "registry") {
           text = await callRegistryModel(ctx, m, images, prompt, timeout);
+          // 伪多模态检测：registry 模型声明支持图片但可能实际无法处理（如 sensenova）
+          if (!appearsToUnderstandImage(text)) {
+            throw new Error("伪多模态：模型未真正理解图片内容（回复中缺少图片描述）");
+          }
         } else if (m.source === "discovered") {
           text = await callDiscoveredModel(m, images, prompt, timeout);
+          if (!appearsToUnderstandImage(text)) {
+            throw new Error("伪多模态：模型未真正理解图片内容（回复中缺少图片描述）");
+          }
         } else {
           const key = await getOrKey();
           if (!key) {
@@ -928,6 +935,74 @@ async function describeImages(
 // ---------------------------------------------------------------------------
 // 工具函数
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// 伪多模态检测：模型声明支持图片但实际上无法理解图片时，返回的文本中
+// 会包含明显的"无法查看/处理图片"类措辞，而不会描述图片实际内容。
+// 通过检测这类措辞 + 缺少图片特征词，判断模型是否真正理解了图片。
+// ---------------------------------------------------------------------------
+
+/** 模型未真正处理图片时的常见回复模式 */
+const CANNOT_SEE_IMAGE_PATTERNS: RegExp[] = [
+  /无法查看图片/i,
+  /无法处理图片/i,
+  /无法识别图片/i,
+  /没有看到.*图片/i,
+  /未提供.*图片/i,
+  /无法访问.*图片/i,
+  /无法读取.*图片/i,
+  /没有.*图片.*内容/i,
+  /没有上传图片/i,
+  /没有.*附带.*图片/i,
+  /无法分析图片/i,
+  /看不到.*图片/i,
+  /不能.*图片/i,
+  /无法直接查看/i,
+  /没有收到.*图片/i,
+  /对话中.*没有.*图片/i,
+  /没有.*图像/i,
+  /不能查看图片/i,
+  /not\s+able\s+to\s+(see|view|process|analyze|access)/i,
+  /cannot\s+(see|view|process|analyze|access)\s+(the\s+)?image/i,
+  /no\s+(image|picture)\s+(was|has\s+been|has)/i,
+  /I\s+cannot\s+(see|view|process|analyze|access)/i,
+];
+
+/** 图片描述中应包含的特征词（用于确认模型真正处理了图片） */
+const IMAGE_CONTENT_HINTS: RegExp[] = [
+  /颜色/i,
+  /色彩/i,
+  /红色|蓝色|绿色|黑色|白色|黄色|紫色|粉色|棕色/i,
+  /头发|长发|短发/i,
+  /眼睛|眼/i,
+  /脸|面部/i,
+  /衣服|服装|裙|衬衫|外套/i,
+  /背景/i,
+  /场景/i,
+  /人物/i,
+  /男性|女性/i,
+  /男|女/i,
+  /物体/i,
+  /文字/i,
+  /布局/i,
+  /形状/i,
+  /photo|image|picture/i,
+  /color|background/i,
+];
+
+/**
+ * 判断模型回复是否真正理解了图片。
+ * 返回 false 表示模型没有看到/理解图片（伪多模态），应该跳过。
+ */
+function appearsToUnderstandImage(text: string): boolean {
+  const cleaned = text.trim();
+  if (cleaned.length < 20) return false;
+  const hasCannotSeePattern = CANNOT_SEE_IMAGE_PATTERNS.some((p) => p.test(cleaned));
+  const hasImageContent = IMAGE_CONTENT_HINTS.some((p) => p.test(cleaned));
+  // 有明确"看不到图片"措辞 + 没有图片特征词 → 未真正理解图片
+  if (hasCannotSeePattern && !hasImageContent) return false;
+  return true;
+}
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
