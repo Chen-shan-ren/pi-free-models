@@ -130,7 +130,7 @@ function getEnvValue(name: string): string | undefined {
   try {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { execSync } = require("node:child_process") as typeof import("node:child_process");
-    const out = execSync(`reg query \\"HKCU\\\\\\\\Environment\\" /v ${name}`, {
+    const out = execSync(`reg query \"HKCU\\\\Environment\" /v ${name}`, {
       encoding: "utf8",
       windowsHide: true,
       timeout: 5000,

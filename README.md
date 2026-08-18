@@ -35,7 +35,7 @@
 | 🔄 **自动刷新** | 免费列表变化频繁（每周甚至更勤），缓存 6h 自动重拉；失败自动回退缓存 |
 | 📷 **自动看图** | 文本模型收到图片时，自动调用视觉池最高优先级的多模态模型描述 |
 | 🗣️ **自然语言触发** | 发音频自动转写、说"读出来"自动合成语音、问相似度自动嵌入、说"画图"自动生图——五池全部自动/半自动 |
-| 🖼️ **图像生成池** | `/img-generate <提示词>` 或 `generate_image` 工具：按优先级生成图片，保存到本地 |
+| 🖼️ **图像生成池** | `/img-generate <提示词>` 或 `generate_image` 工具：按优先级生成图片，保存到本地；支持 OpenRouter + 用户服务商双路径（`/img-add` 把 agnes-image 等服务商模型入池） |
 | 🔢 **嵌入池** | `/embed <文本>` 或 `embed_text` 工具：文本 → 向量（相似度/检索） |
 | 🎙️ **TTS 池** | `/tts <文本>` 或 `text_to_speech` 工具：文本 → 语音文件 |
 | 🗣️ **ASR 池** | `/asr <音频>` 或 `transcribe_audio` 工具：音频 → 文本 |
@@ -203,7 +203,9 @@ pi 启动 ──► 拉取 OpenRouter 全量目录（或读 6h 内缓存）
 | `/mm-priority [数字] [关键字]` | 设置模型优先级（无参数时交互选择） |
 | `/mm-discover [full]` | AI 自动发现（增量 / 全量） |
 | `/img-pool` · `/img-refresh` · `/img-priority` | 图像生成池管理 |
-| `/img-generate <提示词>` | 生成图片并保存（默认 Downloads 目录） |
+| `/img-add [provider] [modelId]` | 把用户服务商的图像生成模型（如 agnes-image-2.1-flash）加入池，端点验证后入池 |
+| `/img-remove [关键字]` | 从图像池移除模型 |
+| `/img-generate <提示词>` | 生成图片并保存（默认 Downloads 目录）；尺寸不被支持时自动回退 |
 | `/embed-pool` · `/embed-discover` · `/embed <文本>` | 嵌入池：查看 / 发现 / 文本转向量 |
 | `/tts-pool` · `/tts-discover` · `/tts <文本>` | TTS 池：查看 / 发现 / 文本转语音 |
 | `/asr-pool` · `/asr-discover` · `/asr <音频>` | ASR 池：查看 / 发现 / 音频转文本 |
@@ -315,6 +317,7 @@ pi-wanchuan/              # 复制整个目录到 ~/.pi/agent/extensions/
 | 2026-08 | 新增嵌入/TTS/ASR 端点池（服务商发现 + 端点实测验证，含首次启动自动发现） |
 | 2026-08 | 新增内置 provider 筛选（nvidia / cloudflare-workers-ai / zai 只保留旗舰模型） |
 | 2026-08 | 新增 AI 自动发现（autoDiscover：服务商 /models + LLM 分析 + 带图片实测验证） |
+| 2026-08 | 图像生成池兼容性升级：支持用户服务商图像生成模型（/img-add 端点验证入池）、尺寸自动回退、OpenRouter key 按需获取；视觉池/端点池不再强制依赖 OpenRouter；修复 Windows 注册表环境变量读取 |
 
 ---
 

@@ -867,10 +867,14 @@ async function describeImages(
 ): Promise<{ text: string; modelId: string }> {
   const pool = await ensureFreshPool(ctx);
   const config = pool.config;
-  const apiKey = await getOpenRouterApiKey(ctx);
-  if (!apiKey) {
-    throw new Error("未找到 OpenRouter API key（请运行 /login openrouter 或设置 OPENROUTER_API_KEY）");
-  }
+  // OpenRouter key 按需获取：只有真正轮到 OpenRouter 模型时才会检查，
+  // 池中全是 registry/discovered 模型时无需 openrouter key。
+  let orKeyCache: string | undefined | null;
+  const getOrKey = async (): Promise<string | undefined> => {
+    if (orKeyCache === null) return undefined;
+    if (orKeyCache === undefined) orKeyCache = (await getOpenRouterApiKey(ctx)) ?? null;
+    return orKeyCache ?? undefined;
+  };
   const prompt = promptOverride ?? config.describePrompt;
   const timeout = signal ?? AbortSignal.timeout(DESCRIBE_TIMEOUT_MS);
   const tried = new Set<string>();
@@ -881,12 +885,21 @@ async function describeImages(
       if (m.offline || tried.has(m.id)) continue;
       tried.add(m.id);
       try {
-        const text =
-          m.source === "registry"
-            ? await callRegistryModel(ctx, m, images, prompt, timeout)
-            : m.source === "discovered"
-              ? await callDiscoveredModel(m, images, prompt, timeout)
-              : await callOpenRouter(config, apiKey, m.id, images, prompt, timeout);
+        let text: string;
+        if (m.source === "registry") {
+          text = await callRegistryModel(ctx, m, images, prompt, timeout);
+        } else if (m.source === "discovered") {
+          text = await callDiscoveredModel(m, images, prompt, timeout);
+        } else {
+          const key = await getOrKey();
+          if (!key) {
+            throw new Error(
+              "未找到 OpenRouter API key（/login openrouter 或 OPENROUTER_API_KEY）——" +
+                "若要使用该模型请先配置 key，或用 /mm-priority 把已有自定义模型排更前",
+            );
+          }
+          text = await callOpenRouter(config, key, m.id, images, prompt, timeout);
+        }
         const modelId =
           m.source === "registry" || m.source === "discovered" ? `${m.provider}/${m.id}` : m.id;
         return { text, modelId };

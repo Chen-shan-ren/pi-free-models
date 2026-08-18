@@ -1,17 +1,24 @@
 /**
  * image-gen.ts — 图像生成池（pi-wanchuan 万川扩展模块）
  *
- * 从 OpenRouter 全量目录中筛选"图像生成模型"（architecture.output_modalities 含 image），
- * 组成图像生成池，按优先级调用生成图片并保存到本地。
+ * 图像生成池由两类来源组成：
+ *   1. OpenRouter 目录：自动筛选"图像生成模型"（architecture.output_modalities 含 image），
+ *      按优先级调用生成图片并保存到本地。
+ *   2. 用户服务商模型（/img-add）：把 models.json 中已配置鉴权的服务商图像生成模型
+ *      （如 agnes-image-2.1-flash、sensenova-u1-fast）加入池，直接调其
+ *      /images/generations 端点（OpenAI 兼容格式），不再被 OpenRouter 绑定。
+ *      刷新 OpenRouter 目录时用户条目自动保留。
  *
  * 命令：
- *   /img-pool [free|all]        查看图像生成池
- *   /img-refresh                强制刷新池
- *   /img-priority [n] [关键字]  设置优先级
- *   /img-generate <提示词>      生成图片并保存
+ *   /img-pool [free|all|offline]   查看图像生成池
+ *   /img-refresh                   强制刷新池
+ *   /img-add [provider] [modelId]  把用户服务商的图像生成模型加入池（端点验证）
+ *   /img-remove [关键字]           从池中移除模型
+ *   /img-priority [n] [关键字]     设置优先级
+ *   /img-generate <提示词>         生成图片并保存
  *
  * 工具：
- *   generate_image              生成图片（LLM 可调用）
+ *   generate_image                 生成图片（LLM 可调用）
  *
  * 注意：OpenRouter 当前没有免费的图像生成模型（池内均为付费模型，调用按量计费）。
  */
@@ -20,6 +27,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Type } from "typebox";
 import { join } from "node:path";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { getOpenRouterCatalog, isFreeModel, type RawORModel } from "./or-free.ts";
 
@@ -30,6 +38,10 @@ interface ImgPoolModel {
   priority: number;
   userSet?: boolean;
   offline?: boolean;
+  /** 用户服务商条目：models.json 中的 provider id（缺省 = openrouter 目录条目） */
+  provider?: string;
+  baseUrl?: string;
+  apiKeyRef?: string;
 }
 
 interface ImgPoolConfig {
@@ -53,8 +65,69 @@ const DEFAULT_IMG_CONFIG: ImgPoolConfig = {
   maxModels: 50,
 };
 
+const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
+
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/** 读取环境变量：优先进程环境，回退 Windows 注册表（setx 后未重启也能读到）。 */
+function getEnvValue(name: string): string | undefined {
+  const v = process.env[name];
+  if (v) return v;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { execSync } = require("node:child_process") as typeof import("node:child_process");
+    const out = execSync(`reg query \"HKCU\\\\Environment\" /v ${name}`, {
+      encoding: "utf8",
+      windowsHide: true,
+      timeout: 5000,
+    });
+    const m = out.match(/REG_SZ\s+(\S.*)/);
+    return m ? m[1].trim() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** 解析 apiKey 配置值：支持明文与 $ENV 引用。 */
+function resolveApiKey(apiKeyConfig: unknown): string | undefined {
+  if (typeof apiKeyConfig !== "string" || !apiKeyConfig) return undefined;
+  const m = apiKeyConfig.match(/^\$(.+)$/);
+  return m ? getEnvValue(m[1]) : apiKeyConfig;
+}
+
+/** 从 models.json 读用户服务商定义（有 baseUrl 且能解析出 key 的）。 */
+function readUserProviders(): Array<{
+  id: string;
+  name: string;
+  baseUrl: string;
+  apiKey: string;
+  apiKeyRef?: string;
+}> {
+  const out: Array<{ id: string; name: string; baseUrl: string; apiKey: string; apiKeyRef?: string }> = [];
+  try {
+    const raw = readFileSync(join(getAgentDir(), "models.json"), "utf8");
+    const cfg = JSON.parse(raw) as {
+      providers?: Record<string, { name?: string; baseUrl?: string; apiKey?: string }>;
+    };
+    for (const [id, def] of Object.entries(cfg.providers ?? {})) {
+      if (id === "openrouter") continue; // OpenRouter 有专门路径
+      if (!def?.baseUrl) continue;
+      const apiKey = resolveApiKey(def.apiKey);
+      if (!apiKey) continue;
+      out.push({
+        id,
+        name: def.name ?? id,
+        baseUrl: def.baseUrl.endsWith("/") ? def.baseUrl.slice(0, -1) : def.baseUrl,
+        apiKey,
+        apiKeyRef: typeof def.apiKey === "string" && def.apiKey.startsWith("$") ? def.apiKey : undefined,
+      });
+    }
+  } catch {
+    // 无 models.json
+  }
+  return out;
 }
 
 async function loadImgPool(): Promise<ImgPoolState> {
@@ -94,10 +167,13 @@ function sortImgModels(models: ImgPoolModel[]): ImgPoolModel[] {
   );
 }
 
-/** 从 OpenRouter 目录构建图像生成池（output 含 image，排除路由别名）。 */
+/** 从 OpenRouter 目录构建图像生成池（output 含 image，排除路由别名）。
+ *  用户服务商条目（provider 非空且非 openrouter）原样保留，不参与目录刷新。 */
 function buildImgPool(current: ImgPoolState, raw: RawORModel[]): ImgPoolState {
   const prevById = new Map(current.models.map((m) => [m.id, m]));
   const rawIds = new Set(raw.map((r) => r.id));
+  // 用户服务商条目：保留（不被 OpenRouter 下架逻辑影响）
+  const custom = current.models.filter((m) => m.provider && m.provider !== "openrouter");
   const models: ImgPoolModel[] = [];
   for (const r of raw) {
     const out = (r.architecture?.output_modalities ?? []).map((s) => String(s).toLowerCase());
@@ -114,15 +190,16 @@ function buildImgPool(current: ImgPoolState, raw: RawORModel[]): ImgPoolState {
       offline: false,
     });
   }
-  // 下架保留
+  // 下架保留（仅 OpenRouter 条目）
   const offlineModels: ImgPoolModel[] = [];
   for (const prev of current.models) {
+    if (prev.provider && prev.provider !== "openrouter") continue; // 用户条目不标记下架
     if (!models.some((m) => m.id === prev.id)) {
       if (rawIds.has(prev.id)) continue; // 被排除（如路由别名）
       offlineModels.push({ ...prev, offline: true });
     }
   }
-  let all = sortImgModels([...models, ...offlineModels]);
+  let all = sortImgModels([...custom, ...models, ...offlineModels]);
   if (current.config.maxModels > 0 && all.length > current.config.maxModels) {
     const keep = all.filter((m) => m.userSet);
     for (const m of all) {
@@ -164,7 +241,54 @@ async function ensureImgPool(ctx: ExtensionContext): Promise<ImgPoolState> {
   }
 }
 
-/** 生成图片：按优先级尝试池中模型，成功返回 { path, modelId }。 */
+// ---------------------------------------------------------------------------
+// 调用：OpenRouter / 用户服务商 两条路径
+// ---------------------------------------------------------------------------
+
+interface GenResult {
+  b64?: string;
+  url?: string;
+}
+
+/** 调用任意 OpenAI 兼容 /images/generations 端点。返回图片 base64 与扩展名。 */
+async function callImageEndpoint(
+  baseUrl: string,
+  apiKey: string,
+  modelId: string,
+  prompt: string,
+  size: string,
+  signal: AbortSignal,
+): Promise<{ b64: string; ext: string }> {
+  const res = await fetch(`${baseUrl}/images/generations`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({ model: modelId, prompt, n: 1, size }),
+    signal,
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`HTTP ${res.status} ${body.slice(0, 150)}`);
+  }
+  const j = (await res.json()) as { data?: GenResult[] };
+  const item = j?.data?.[0];
+  if (!item) throw new Error("空响应");
+  if (item.b64_json) return { b64: item.b64_json, ext: "png" };
+  if (item.url) {
+    const imgRes = await fetch(item.url, { signal });
+    const buf = Buffer.from(await imgRes.arrayBuffer());
+    return {
+      b64: buf.toString("base64"),
+      ext: imgRes.headers.get("content-type")?.includes("jpeg") ? "jpg" : "png",
+    };
+  }
+  throw new Error("响应中没有图片数据");
+}
+
+/** 生成图片：按优先级尝试池中模型（OpenRouter 与用户服务商混排），
+ *  尺寸不被支持时自动回退（1024 → 512 → 256）。 */
 async function generateImage(
   ctx: ExtensionContext,
   prompt: string,
@@ -172,71 +296,75 @@ async function generateImage(
 ): Promise<{ path: string; modelId: string }> {
   const pool = await ensureImgPool(ctx);
   const config = pool.config;
-  const apiKey = await (async () => {
-    try {
-      const k = await ctx.modelRegistry.getApiKeyForProvider("openrouter");
-      if (k) return k;
-    } catch {
-      // 环境变量兜底
-    }
-    return process.env.OPENROUTER_API_KEY;
-  })();
-  if (!apiKey) {
-    throw new Error("未找到 OpenRouter API key（/login openrouter 或 OPENROUTER_API_KEY）");
-  }
-  const baseUrl = "https://openrouter.ai/api/v1";
   const tried = new Set<string>();
   const errors: string[] = [];
   const timeout = signal ?? AbortSignal.timeout(180_000);
+
+  // 可回退的尺寸序列（去重）
+  const sizes = [...new Set([config.size, "1024x1024", "512x512", "256x256"])];
 
   const attempt = async (candidates: ImgPoolModel[]) => {
     for (const m of candidates) {
       if (m.offline || tried.has(m.id)) continue;
       tried.add(m.id);
       try {
-        const res = await fetch(`${baseUrl}/images/generations`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${apiKey}`,
-          },
-          body: JSON.stringify({
-            model: m.id,
-            prompt,
-            n: 1,
-            size: config.size,
-          }),
-          signal: timeout,
-        });
-        if (!res.ok) {
-          const body = await res.text().catch(() => "");
-          throw new Error(`HTTP ${res.status} ${body.slice(0, 150)}`);
-        }
-        const j = (await res.json()) as { data?: Array<{ b64_json?: string; url?: string }> };
-        const item = j?.data?.[0];
-        if (!item) throw new Error("空响应");
-        let imageData: string;
-        let ext = "png";
-        if (item.b64_json) {
-          imageData = item.b64_json;
-        } else if (item.url) {
-          const imgRes = await fetch(item.url, { signal: timeout });
-          const buf = Buffer.from(await imgRes.arrayBuffer());
-          imageData = buf.toString("base64");
-          ext = imgRes.headers.get("content-type")?.includes("jpeg") ? "jpg" : "png";
+        let apiKey: string | undefined;
+        let baseUrl: string;
+        if (m.provider && m.provider !== "openrouter") {
+          // 用户服务商路径
+          baseUrl = m.baseUrl ?? "";
+          if (!baseUrl) throw new Error(`模型 ${m.id} 缺少 baseUrl`);
+          apiKey = m.apiKeyRef ? getEnvValue(m.apiKeyRef.replace(/^\$/, "")) : undefined;
         } else {
-          throw new Error("响应中没有图片数据");
+          // OpenRouter 路径
+          baseUrl = OPENROUTER_BASE;
+          try {
+            apiKey = await ctx.modelRegistry.getApiKeyForProvider("openrouter");
+          } catch {
+            // 环境变量兜底
+          }
+          apiKey = apiKey ?? process.env.OPENROUTER_API_KEY;
         }
-        // 保存文件
-        const outDir =
-          config.outputDir || join(process.env.USERPROFILE ?? process.env.HOME ?? ".", "Downloads");
-        await mkdir(outDir, { recursive: true });
-        const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-        const file = join(outDir, `wanchuan-${stamp}.${ext}`);
-        await writeFile(file, Buffer.from(imageData, "base64"));
-        return { path: file, modelId: m.id };
+        if (!apiKey) {
+          throw new Error(
+            m.provider && m.provider !== "openrouter"
+              ? `无法解析 ${m.provider} 的 API key（apiKeyRef: ${m.apiKeyRef ?? "未配置"}）`
+              : "未找到 OpenRouter API key（/login openrouter 或 OPENROUTER_API_KEY）",
+          );
+        }
+        // 逐尺寸尝试：尺寸不被支持的错误降级到更小尺寸
+        let lastErr: Error | undefined;
+        for (const size of sizes) {
+          try {
+            const { b64, ext } = await callImageEndpoint(
+              baseUrl,
+              apiKey,
+              m.id,
+              prompt,
+              size,
+              timeout,
+            );
+            const outDir =
+              config.outputDir || join(process.env.USERPROFILE ?? process.env.HOME ?? ".", "Downloads");
+            await mkdir(outDir, { recursive: true });
+            const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+            const file = join(outDir, `wanchuan-${stamp}.${ext}`);
+            await writeFile(file, Buffer.from(b64, "base64"));
+            return { path: file, modelId: m.id };
+          } catch (err) {
+            lastErr = err instanceof Error ? err : new Error(String(err));
+            const msg = lastErr.message;
+            if (/size|resolution|dimension|1024|x1024|not support|unsupported/i.test(msg)) {
+              continue; // 尺寸问题：换更小尺寸重试
+            }
+            break; // 其他错误：不换尺寸
+          }
+        }
+        throw lastErr ?? new Error("生成失败");
       } catch (err) {
-        errors.push(`${m.id}: ${errMsg(err)}`);
+        errors.push(
+          `${m.provider && m.provider !== "openrouter" ? `${m.provider}/${m.id}` : m.id}: ${errMsg(err)}`,
+        );
       }
     }
     return undefined;
@@ -255,8 +383,46 @@ async function generateImage(
   return result;
 }
 
+// ---------------------------------------------------------------------------
+// /img-add：把用户服务商的图像生成模型加入池（端点验证）
+// ---------------------------------------------------------------------------
+
+/** 端点验证：发一个最小生成请求（256x256 + 简短 prompt），200 且有图即通过。
+ *  注意：会真实生成一次极小图片（按量计费，费用极低）。 */
+async function verifyImageModel(
+  baseUrl: string,
+  apiKey: string,
+  modelId: string,
+): Promise<boolean> {
+  try {
+    await callImageEndpoint(baseUrl, apiKey, modelId, "a simple red circle on a white background", "256x256", AbortSignal.timeout(60_000));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** 拉取服务商模型列表（OpenAI 兼容 /models 端点）。失败返回 null。 */
+async function fetchProviderModelList(
+  baseUrl: string,
+  apiKey: string,
+): Promise<string[] | null> {
+  try {
+    const res = await fetch(`${baseUrl.replace(/\/$/, "")}/models`, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: AbortSignal.timeout(20_000),
+    });
+    if (!res.ok) return null;
+    const j = (await res.json()) as { data?: { id?: string }[] };
+    const list = Array.isArray(j?.data) ? j.data.filter((m) => typeof m.id === "string").map((m) => m.id as string) : [];
+    return list.length > 0 ? list : null;
+  } catch {
+    return null;
+  }
+}
+
 export function initImageGen(pi: ExtensionAPI): void {
-  // ---- 命令 ----
+  // ---- 命令：/img-pool ----
   pi.registerCommand("img-pool", {
     description: "查看图像生成池（按优先级排序）。可选参数：free / all / offline",
     handler: async (args, ctx) => {
@@ -267,6 +433,7 @@ export function initImageGen(pi: ExtensionAPI): void {
         return;
       }
       const online = pool.models.filter((m) => !m.offline);
+      const customCount = online.filter((m) => m.provider && m.provider !== "openrouter").length;
       const list = sortImgModels(pool.models).filter((m) => {
         if (filter === "free") return !m.offline && m.free;
         if (filter === "offline") return m.offline;
@@ -274,14 +441,16 @@ export function initImageGen(pi: ExtensionAPI): void {
         return !m.offline;
       });
       const lines = [
-        `图像生成池：在线 ${online.length} 个（免费 ${online.filter((m) => m.free).length}），` +
-          `下架 ${pool.models.length - online.length} 个，更新于 ${new Date(pool.updatedAt).toLocaleString()}`,
-        `用法：/img-generate <提示词> · /img-priority [数字] [关键字]`,
+        `图像生成池：在线 ${online.length} 个（免费 ${online.filter((m) => m.free).length}，` +
+          `自定义 ${customCount}），下架 ${pool.models.length - online.length} 个，` +
+          `更新于 ${new Date(pool.updatedAt).toLocaleString()}`,
+        `用法：/img-generate <提示词> · /img-add [provider] [modelId] · /img-priority [数字] [关键字]`,
         ``,
         ...list.map(
           (m, i) =>
             `${String(i + 1).padStart(3)}. [${String(m.priority).padStart(5)}] ` +
-            `${m.offline ? "⚠下架" : m.free ? "FREE" : "paid"} ${m.id}` +
+            `${m.offline ? "⚠下架" : m.free ? "FREE" : "paid"} ` +
+            `${m.provider && m.provider !== "openrouter" ? `${m.provider}/${m.id}` : m.id}` +
             `${m.userSet ? "  [自定义优先级]" : ""}`,
         ),
       ];
@@ -294,6 +463,7 @@ export function initImageGen(pi: ExtensionAPI): void {
     },
   });
 
+  // ---- 命令：/img-refresh ----
   pi.registerCommand("img-refresh", {
     description: "强制刷新图像生成池",
     handler: async (_args, ctx) => {
@@ -310,6 +480,110 @@ export function initImageGen(pi: ExtensionAPI): void {
     },
   });
 
+  // ---- 命令：/img-add ----
+  pi.registerCommand("img-add", {
+    description: "把用户服务商（models.json 中配置的）图像生成模型加入池。用法：/img-add [provider] [modelId]",
+    handler: async (args, ctx) => {
+      const providers = readUserProviders();
+      if (providers.length === 0) {
+        ctx.ui.notify("没有找到已配置鉴权的用户服务商（请先在 models.json 配置 baseUrl + apiKey）", "warning");
+        return;
+      }
+      const parts = (args || "").trim().split(/\s+/).filter(Boolean);
+      let provider = parts[0];
+      let modelId = parts[1];
+
+      // 选择服务商
+      if (!provider) {
+        const picked = await ctx.ui.select(
+          "选择服务商：",
+          providers.map((p) => `${p.id}（${p.name}）`),
+        );
+        provider = picked?.split("（")[0];
+        if (!provider) return;
+      }
+      const def = providers.find((p) => p.id === provider);
+      if (!def) {
+        ctx.ui.notify(`服务商 ${provider} 不在 models.json 中（或缺少 baseUrl/apiKey）`, "warning");
+        return;
+      }
+      // 选择模型
+      if (!modelId) {
+        const list = await fetchProviderModelList(def.baseUrl, def.apiKey);
+        if (!list || list.length === 0) {
+          ctx.ui.notify(`无法获取 ${def.name} 的模型列表`, "warning");
+          return;
+        }
+        const picked = await ctx.ui.select(
+          `选择 ${def.name} 的图像生成模型：`,
+          list,
+        );
+        modelId = picked;
+        if (!modelId) return;
+      }
+      const pool = await loadImgPool();
+      if (pool.models.some((m) => m.id === modelId && !m.offline)) {
+        ctx.ui.notify(`模型 ${modelId} 已在图像池中`, "info");
+        return;
+      }
+      ctx.ui.notify(`正在验证 ${def.name}/${modelId}（会生成一张 256x256 极小测试图，按量计费）…`, "info");
+      const ok = await verifyImageModel(def.baseUrl, def.apiKey, modelId);
+      if (!ok) {
+        ctx.ui.notify(`验证失败：${def.name}/${modelId} 不是可用的图像生成模型（或端点不兼容）`, "error");
+        return;
+      }
+      const maxP = Math.max(0, ...pool.models.map((m) => m.priority));
+      pool.models.push({
+        id: modelId,
+        name: `${def.name} ${modelId}`,
+        free: false,
+        priority: maxP + 1,
+        provider: def.id,
+        baseUrl: def.baseUrl,
+        apiKeyRef: def.apiKeyRef,
+      });
+      pool.updatedAt = Date.now();
+      await saveImgPool(pool);
+      ctx.ui.notify(`✅ 已加入图像池：${def.name}/${modelId}（当前优先级 ${maxP + 1}）`, "info");
+    },
+  });
+
+  // ---- 命令：/img-remove ----
+  pi.registerCommand("img-remove", {
+    description: "从图像池移除模型。用法：/img-remove [关键字]",
+    handler: async (args, ctx) => {
+      const pool = await loadImgPool();
+      const online = pool.models.filter((m) => !m.offline);
+      if (online.length === 0) {
+        ctx.ui.notify("图像池为空", "warning");
+        return;
+      }
+      const keyword = (args || "").trim().toLowerCase();
+      const matches = keyword
+        ? online.filter((mm) => mm.id.toLowerCase().includes(keyword) || mm.name.toLowerCase().includes(keyword))
+        : online;
+      if (matches.length === 0) {
+        ctx.ui.notify(`没有找到匹配“${keyword}”的模型`, "warning");
+        return;
+      }
+      let target: ImgPoolModel | undefined;
+      if (matches.length === 1) {
+        target = matches[0];
+      } else {
+        const picked = await ctx.ui.select(
+          `选择要移除的模型（${matches.length} 个匹配）：`,
+          matches.map((mm) => `[${mm.priority}] ${mm.id}`),
+        );
+        target = matches.find((mm) => `[${mm.priority}] ${mm.id}` === picked);
+      }
+      if (!target) return;
+      pool.models = pool.models.filter((mm) => mm.id !== target!.id);
+      await saveImgPool(pool);
+      ctx.ui.notify(`已移除 ${target.id}`, "info");
+    },
+  });
+
+  // ---- 命令：/img-priority ----
   pi.registerCommand("img-priority", {
     description: "设置图像池模型优先级（数字越小越优先）。用法：/img-priority [数字] [关键字]",
     handler: async (args, ctx) => {
@@ -366,6 +640,7 @@ export function initImageGen(pi: ExtensionAPI): void {
     },
   });
 
+  // ---- 命令：/img-generate ----
   pi.registerCommand("img-generate", {
     description: "生成图片并保存到本地。用法：/img-generate <提示词>",
     handler: async (args, ctx) => {
@@ -384,14 +659,14 @@ export function initImageGen(pi: ExtensionAPI): void {
     },
   });
 
-  // ---- 工具 ----
+  // ---- 工具：generate_image ----
   pi.registerTool({
     name: "generate_image",
     label: "Generate Image",
     description:
       "通过图像生成池生成一张图片并保存到本地。prompt 为图片描述；outputPath 可选（默认 Downloads 目录）。返回保存路径。注意：图像生成模型需要付费额度。",
-      promptSnippet: "生成图片（AI 绘图）",
-      promptGuidelines: ["当用户要求画图、生成图片、绘图、制作插画/海报/logo 等图像生成需求时，使用 generate_image 工具（提示词要详细：主体、风格、构图、细节）。生成会消耗付费额度。"],
+    promptSnippet: "生成图片（AI 绘图）",
+    promptGuidelines: ["当用户要求画图、生成图片、绘图、制作插画/海报/logo 等图像生成需求时，使用 generate_image 工具（提示词要详细：主体、风格、构图、细节）。生成会消耗付费额度。"],
     parameters: Type.Object({
       prompt: Type.String({ description: "图片内容描述" }),
       outputPath: Type.Optional(Type.String({ description: "保存路径（默认 Downloads）" })),
